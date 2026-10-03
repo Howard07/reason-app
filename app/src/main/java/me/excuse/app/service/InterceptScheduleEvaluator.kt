@@ -1,7 +1,6 @@
 package me.excuse.app.service
 
 import me.excuse.app.data.prefs.InterceptSchedule
-import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
@@ -18,29 +17,6 @@ import java.time.ZoneId
  *  - 判定只决定「是否发起新的拦截」，不改变已进入 InSession / TimeUp 的会话。
  */
 object InterceptScheduleEvaluator {
-
-    /** 全部 7 天，按 ISO 周一到周日排序。 */
-    val allDays: List<DayOfWeek> = listOf(
-        DayOfWeek.MONDAY,
-        DayOfWeek.TUESDAY,
-        DayOfWeek.WEDNESDAY,
-        DayOfWeek.THURSDAY,
-        DayOfWeek.FRIDAY,
-        DayOfWeek.SATURDAY,
-        DayOfWeek.SUNDAY,
-    )
-
-    /** 工作日（周一～周五）。 */
-    val weekdays: Set<DayOfWeek> = setOf(
-        DayOfWeek.MONDAY,
-        DayOfWeek.TUESDAY,
-        DayOfWeek.WEDNESDAY,
-        DayOfWeek.THURSDAY,
-        DayOfWeek.FRIDAY,
-    )
-
-    /** 周末（周六、周日）。 */
-    val weekend: Set<DayOfWeek> = setOf(DayOfWeek.SATURDAY, DayOfWeek.SUNDAY)
 
     fun shouldIntercept(
         schedule: InterceptSchedule,

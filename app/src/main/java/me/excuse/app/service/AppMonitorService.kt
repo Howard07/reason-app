@@ -36,6 +36,7 @@ import me.excuse.app.BuildConfig
 import me.excuse.app.MainActivity
 import me.excuse.app.R
 import me.excuse.app.data.prefs.InterceptSchedule
+import me.excuse.app.data.prefs.PauseSource
 import me.excuse.app.service.InterceptStateMachine.Effect
 import java.time.LocalDate
 import java.time.ZoneId
@@ -311,9 +312,14 @@ class AppMonitorService : LifecycleService() {
                 getString(R.string.notification_active_text, remainMin)
             }
             interceptSchedule.isPausedAt(now) -> {
-                val until = interceptSchedule.pauseUntilMillis ?: now
-                val remainMin = ((until - now + 59_999L) / 60_000L).toInt().coerceAtLeast(1)
-                getString(R.string.notification_paused_until, remainMin)
+                when (interceptSchedule.pauseSource) {
+                    PauseSource.END_OF_DAY -> getString(R.string.notification_rest_day)
+                    else -> {
+                        val until = interceptSchedule.pauseUntilMillis ?: now
+                        val remainMin = ((until - now + 59_999L) / 60_000L).toInt().coerceAtLeast(1)
+                        getString(R.string.notification_paused_until, remainMin)
+                    }
+                }
             }
             !shouldInterceptNow(now) -> getString(R.string.notification_rest_day)
             else -> getString(R.string.notification_text)
