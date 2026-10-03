@@ -80,13 +80,15 @@ class InterceptStateMachine(
         monitored: Set<String>,
         now: Long,
         entryEdge: Boolean = false,
+        interceptEnabled: Boolean = true,
     ): List<Effect> {
         return when (val s = state) {
-            is State.Unknown, is State.Background -> handleNoOverlayTick(foreground, monitored, now)
-            is State.Prompting -> handlePromptingTick(s, foreground, monitored, now, entryEdge)
-            is State.InSession -> handleSessionTick(s, foreground, monitored, now, entryEdge)
-            is State.SessionLeaving -> handleSessionLeavingTick(s, foreground, monitored, now)
-            is State.TimeUp -> handleTimeUpTick(s, foreground, monitored, now)
+            is State.Unknown, is State.Background ->
+                handleNoOverlayTick(foreground, monitored, now, interceptEnabled)
+            is State.Prompting -> handlePromptingTick(s, foreground, monitored, now, entryEdge, interceptEnabled)
+            is State.InSession -> handleSessionTick(s, foreground, monitored, now, entryEdge, interceptEnabled)
+            is State.SessionLeaving -> handleSessionLeavingTick(s, foreground, monitored, now, interceptEnabled)
+            is State.TimeUp -> handleTimeUpTick(s, foreground, monitored, now, interceptEnabled)
         }
     }
 
@@ -94,8 +96,9 @@ class InterceptStateMachine(
         foreground: String?,
         monitored: Set<String>,
         now: Long,
+        interceptEnabled: Boolean,
     ): List<Effect> {
-        if (foreground == null || foreground !in monitored) {
+        if (!interceptEnabled || foreground == null || foreground !in monitored) {
             state = State.Background(foreground)
             return emptyList()
         }
@@ -108,6 +111,7 @@ class InterceptStateMachine(
         monitored: Set<String>,
         now: Long,
         entryEdge: Boolean,
+        interceptEnabled: Boolean,
     ): List<Effect> {
         if (foreground == s.pkg) {
             // The prompt is already the active decision point for this package.
@@ -120,6 +124,12 @@ class InterceptStateMachine(
         // the prompt alive; dismissing here is the classic quick-bypass race.
         if (foreground == null || foreground !in monitored) {
             return emptyList()
+        }
+        // 休息日 / 暂停期间切到了另一个受监控 app：不发起新拦截，放行并回到 Background。
+        // 旧 prompt 的超时计时器照常取消，避免残留。
+        if (!interceptEnabled) {
+            state = State.Background(foreground)
+            return listOf(Effect.CancelPromptTimeout, Effect.Dismiss)
         }
         // 切到了另一个受监控 app：取消旧 prompt 的超时计时器，直接复用同一悬浮窗
         // 让 [enterPrompting] 通过 setContent 把内容换成新 app。
@@ -136,6 +146,7 @@ class InterceptStateMachine(
         monitored: Set<String>,
         now: Long,
         entryEdge: Boolean,
+        interceptEnabled: Boolean,
     ): List<Effect> {
         // 名单是实时配置。用户把当前 app 移出名单后，旧 session 不能继续计时、到点再弹窗；
         // 也不能因为配置变化把人赶回桌面。若此刻实际切到了另一个受监控 app，照常提示它。
@@ -145,6 +156,11 @@ class InterceptStateMachine(
                 Effect.RefreshNotification,
             )
             if (foreground != null && foreground in monitored) {
+                // 休息日 / 暂停期间：不发起新拦截，finalize 后回 Background。
+                if (!interceptEnabled) {
+                    state = State.Background(foreground)
+                    return finished
+                }
                 return finished + enterPrompting(foreground, now)
             }
             state = State.Background(foreground)
@@ -156,6 +172,14 @@ class InterceptStateMachine(
                 state = s.copy(initialEntryPending = false)
                 return emptyList()
             }
+            // 休息日 / 暂停期间同 app 的新 RESUMED 边缘：结束旧 session，但不重弹理由窗。
+            if (!interceptEnabled) {
+                state = State.Background(foreground)
+                return listOf<Effect>(
+                    Effect.FinishSession(s.pkg, endedAt = now, overran = s.extensionCount > 0),
+                    Effect.RefreshNotification,
+                )
+            }
             return listOf<Effect>(
                 Effect.FinishSession(s.pkg, endedAt = now, overran = s.extensionCount > 0),
                 Effect.RefreshNotification,
@@ -163,6 +187,14 @@ class InterceptStateMachine(
         }
         // 切到另一个受监控 app：立刻结束当前 session，弹新 app 拦截窗，不进宽限期
         if (foreground != null && foreground in monitored) {
+            // 休息日 / 暂停期间：不发起新拦截，finalize 后回 Background。
+            if (!interceptEnabled) {
+                state = State.Background(foreground)
+                return listOf<Effect>(
+                    Effect.FinishSession(s.pkg, endedAt = now, overran = s.extensionCount > 0),
+                    Effect.RefreshNotification,
+                )
+            }
             return listOf<Effect>(
                 Effect.FinishSession(s.pkg, endedAt = now, overran = s.extensionCount > 0),
                 Effect.RefreshNotification,
@@ -187,11 +219,12 @@ class InterceptStateMachine(
         foreground: String?,
         monitored: Set<String>,
         now: Long,
+        interceptEnabled: Boolean,
     ): List<Effect> {
         // delay 回调是主路径，但主线程拥堵或协程调度延迟时，10 秒之后的前台事件可能先到。
-        // tick 自己也守住 deadline，避免“回调晚了一拍”把久离误当成宽限内重入。
+        // tick 自己也守住 deadline，避免"回调晚了一拍"把久离误当成宽限内重入。
         if (s.pkg !in monitored || hasSessionLeaveExpired(s, now)) {
-            return finishLeavingAndFollowForeground(s, foreground, monitored, now)
+            return finishLeavingAndFollowForeground(s, foreground, monitored, now, interceptEnabled)
         }
         if (foreground == s.pkg) {
             // 用户回来了。续上 session，不重弹。initialEntryPending 已经是 false（不是初次进入）。
@@ -205,6 +238,10 @@ class InterceptStateMachine(
             return listOf(Effect.CancelSessionLeave, Effect.RefreshNotification)
         }
         if (foreground != null && foreground in monitored) {
+            // 休息日 / 暂停期间切到另一个受监控 app：不发起新拦截，finalize 旧 session 后回 Background。
+            if (!interceptEnabled) {
+                return finishLeavingAndFollowForeground(s, foreground, monitored, now, interceptEnabled)
+            }
             // 切到另一个受监控 app：立刻 finalize 当前 session，进入新 app 拦截
             state = State.Prompting(foreground, now)
             return listOf<Effect>(
@@ -228,6 +265,7 @@ class InterceptStateMachine(
         foreground: String?,
         monitored: Set<String>,
         now: Long,
+        interceptEnabled: Boolean,
     ): List<Effect> {
         val finished = listOf<Effect>(
             Effect.CancelSessionLeave,
@@ -239,6 +277,11 @@ class InterceptStateMachine(
             Effect.RefreshNotification,
         )
         if (foreground != null && foreground in monitored) {
+            // 休息日 / 暂停期间：不发起新拦截，finalize 后直接回 Background。
+            if (!interceptEnabled) {
+                state = State.Background(foreground)
+                return finished
+            }
             return finished + enterPrompting(foreground, now)
         }
         state = State.Background(foreground)
@@ -250,6 +293,7 @@ class InterceptStateMachine(
         foreground: String?,
         monitored: Set<String>,
         now: Long,
+        interceptEnabled: Boolean,
     ): List<Effect> {
         if (foreground == s.pkg && s.pkg in monitored) return emptyList()
         // 到点窗本身会在 deadline 之后才出现；等待它显示或选择「退出」不等于继续使用。
@@ -257,6 +301,11 @@ class InterceptStateMachine(
         val overran = s.extensionCount > 0
         val finish = Effect.FinishSession(s.pkg, endedAt = now, overran = overran)
         if (foreground != null && foreground in monitored) {
+            // 休息日 / 暂停期间：不发起新拦截，收掉到点窗后回 Background。
+            if (!interceptEnabled) {
+                state = State.Background(foreground)
+                return listOf(finish, Effect.Dismiss, Effect.RefreshNotification)
+            }
             // TimeUp 也是一个已经可见的 overlay。切到另一个受监控 app 时原地换成 prompt，
             // 不经历 GONE→VISIBLE，和 Prompting/InSession 的 A→B 路径保持同一不变式。
             return listOf<Effect>(finish, Effect.RefreshNotification) +

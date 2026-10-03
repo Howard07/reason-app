@@ -844,4 +844,107 @@ class InterceptStateMachineTest {
         assertEquals(appA, sched.pkg)
         assertEquals(20_000L, sched.durationMs)
     }
+
+    // ---- 拦截调度：interceptEnabled=false（休息日 / 暂停）不应发起新拦截 ----
+
+    @Test
+    fun interceptDisabledDoesNotPromptFromBackground() {
+        val sm = fresh()
+        val effects = sm.tick(appA, monitored, 1_000L, interceptEnabled = false)
+
+        assertEquals(emptyList<Effect>(), effects)
+        assertEquals(State.Background(appA), sm.state)
+        assertFalse(Effect.ShowPrompt(appA) in effects)
+    }
+
+    @Test
+    fun interceptDisabledWhilePromptingDismissesOnSwitchToOtherMonitoredApp() {
+        val sm = fresh()
+        primePrompting(sm, appA, now = 1_000L)
+
+        // 休息日期间切到另一个受监控 app：不发起新拦截，取消旧计时器并收掉悬浮窗。
+        val effects = sm.tick(appB, monitored, 2_000L, entryEdge = true, interceptEnabled = false)
+
+        assertEquals(
+            listOf(Effect.CancelPromptTimeout, Effect.Dismiss),
+            effects,
+        )
+        assertEquals(State.Background(appB), sm.state)
+    }
+
+    @Test
+    fun interceptDisabledDoesNotBreakOngoingSession() {
+        val sm = fresh()
+        primeSession(sm, appA, startedAt = 1_000L, planned = 30)
+
+        // 同一 app、休息日期间：session 应自然延续，既不被终止也不重弹。
+        val effects = sm.tick(appA, monitored, 2_000L, interceptEnabled = false)
+
+        assertEquals(emptyList<Effect>(), effects)
+        assertTrue(sm.state is State.InSession)
+        assertEquals(appA, (sm.state as State.InSession).pkg)
+    }
+
+    @Test
+    fun interceptDisabledWhileInSessionSwitchingToOtherMonitoredAppFinishesWithoutReprompt() {
+        val sm = fresh()
+        primeSession(sm, appA, startedAt = 1_000L, planned = 30)
+
+        // 休息日期间切到另一个受监控 app：结束旧 session，但不弹新 app 的拦截窗。
+        val effects = sm.tick(appB, monitored, 5_000L, entryEdge = true, interceptEnabled = false)
+
+        assertEquals(
+            listOf(
+                Effect.FinishSession(appA, endedAt = 5_000L, overran = false),
+                Effect.RefreshNotification,
+            ),
+            effects,
+        )
+        assertEquals(State.Background(appB), sm.state)
+        assertFalse(effects.any { it is Effect.ShowPrompt })
+    }
+
+    @Test
+    fun interceptDisabledWhileSessionLeavingSwitchToOtherMonitoredAppFinishesWithoutReprompt() {
+        val sm = fresh()
+        primeSession(sm, appA, startedAt = 1_000L, planned = 30)
+        sm.tick(launcher, monitored, 5_000L)
+        assertTrue(sm.state is State.SessionLeaving)
+
+        // 宽限期内休息日切到 B：finalize A，但不弹 B。
+        val effects = sm.tick(appB, monitored, 6_000L, entryEdge = true, interceptEnabled = false)
+
+        assertEquals(
+            listOf(
+                Effect.CancelSessionLeave,
+                Effect.FinishSession(appA, endedAt = 5_000L, overran = false),
+                Effect.RefreshNotification,
+            ),
+            effects,
+        )
+        assertEquals(State.Background(appB), sm.state)
+        assertFalse(effects.any { it is Effect.ShowPrompt })
+    }
+
+    @Test
+    fun interceptDisabledWhileTimeUpSwitchToOtherMonitoredAppDismissesWithoutReprompt() {
+        val sm = fresh()
+        primeSession(sm, appA, startedAt = 1_000L, planned = 5)
+        sm.onSessionTimeElapsed(appA, now = 301_000L)
+        assertTrue(sm.state is State.TimeUp)
+
+        // 到点窗可见时休息日切到 B：结束 A，收掉到点窗，但不弹 B。
+        val effects = sm.tick(appB, monitored, 302_000L, interceptEnabled = false)
+
+        assertEquals(
+            listOf(
+                Effect.FinishSession(appA, endedAt = 302_000L, overran = false),
+                Effect.Dismiss,
+                Effect.RefreshNotification,
+            ),
+            effects,
+        )
+        assertEquals(State.Background(appB), sm.state)
+        assertFalse(effects.any { it is Effect.ShowPrompt })
+    }
 }

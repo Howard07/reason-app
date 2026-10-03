@@ -35,7 +35,10 @@ import me.excuse.app.AppServices
 import me.excuse.app.BuildConfig
 import me.excuse.app.MainActivity
 import me.excuse.app.R
+import me.excuse.app.data.prefs.InterceptSchedule
 import me.excuse.app.service.InterceptStateMachine.Effect
+import java.time.LocalDate
+import java.time.ZoneId
 
 /** 把 UsageEvents 解释成 sticky 前台并执行状态机 effect；窗口竞争交给 [PromptPresenter]。 */
 class AppMonitorService : LifecycleService() {
@@ -73,6 +76,10 @@ class AppMonitorService : LifecycleService() {
 
     @Volatile private var monitoredCache: Set<String> = emptySet()
     private var monitoredSubscription: Job? = null
+
+    /** 拦截调度配置的最新快照，每轮 poll 据此重算「今天拦不拦」。 */
+    @Volatile private var interceptSchedule: InterceptSchedule = InterceptSchedule()
+    private var scheduleSubscription: Job? = null
 
     private var screenReceiver: BroadcastReceiver? = null
 
@@ -136,6 +143,20 @@ class AppMonitorService : LifecycleService() {
         }
 
         try { promptPresenter.prepareAndWarmUp() } catch (_: Exception) {}
+
+        scheduleSubscription = lifecycleScope.launch {
+            try {
+                app.prefs.interceptSchedule.collect { schedule ->
+                    interceptSchedule = schedule
+                    // 调度变化可能立刻改变「今天拦不拦」，刷新通知以反映最新状态。
+                    refreshNotification()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e(DIAG_TAG, "intercept-schedule subscription failed", error)
+            }
+        }
 
         monitoredSubscription = lifecycleScope.launch {
             try {
@@ -226,6 +247,7 @@ class AppMonitorService : LifecycleService() {
         }
         screenReceiver = null
         monitoredSubscription?.cancel()
+        scheduleSubscription?.cancel()
         pollJob?.cancel()
         notifJob?.cancel()
         // 禁止挂起的确认在快照之后再启动计时器；后台收尾还会等其取消清理真正结束。
@@ -281,12 +303,20 @@ class AppMonitorService : LifecycleService() {
             .filter { (it.startedAt + it.plannedMinutes * 60_000L) > now }
             .minByOrNull { it.startedAt + it.plannedMinutes * 60_000L }
 
-        val text = if (nearest != null) {
-            val remainMs = (nearest.startedAt + nearest.plannedMinutes * 60_000L) - now
-            val remainMin = ((remainMs + 59_999L) / 60_000L).toInt().coerceAtLeast(1)
-            getString(R.string.notification_active_text, remainMin)
-        } else {
-            getString(R.string.notification_text)
+        // 文案优先级：进行中 session（已确认，要自然走完）> 临时暂停 > 今日休息 > 默认。
+        val text = when {
+            nearest != null -> {
+                val remainMs = (nearest.startedAt + nearest.plannedMinutes * 60_000L) - now
+                val remainMin = ((remainMs + 59_999L) / 60_000L).toInt().coerceAtLeast(1)
+                getString(R.string.notification_active_text, remainMin)
+            }
+            interceptSchedule.isPausedAt(now) -> {
+                val until = interceptSchedule.pauseUntilMillis ?: now
+                val remainMin = ((until - now + 59_999L) / 60_000L).toInt().coerceAtLeast(1)
+                getString(R.string.notification_paused_until, remainMin)
+            }
+            !shouldInterceptNow(now) -> getString(R.string.notification_rest_day)
+            else -> getString(R.string.notification_text)
         }
         try {
             val nm = getSystemService(NotificationManager::class.java)
@@ -575,6 +605,7 @@ class AppMonitorService : LifecycleService() {
             monitored = monitoredCache,
             now = now,
             entryEdge = entryEdge,
+            interceptEnabled = shouldInterceptNow(now),
         )
         if (effects.isNotEmpty() || entryEdge) {
             val afterInitialEntryPending =
@@ -592,6 +623,18 @@ class AppMonitorService : LifecycleService() {
     private fun execute(effects: List<Effect>) {
         effects.forEach { execute(it) }
     }
+
+    /**
+     * 「今天拦不拦」：临时暂停优先于周几规则。每轮 tick 用当前时间重算，跨午夜 / 暂停到期
+     * 都能自然切换，不依赖任何定时器。判定用绝对时间戳，保证跨进程、设备重启后语义一致。
+     */
+    private fun shouldInterceptNow(nowMillis: Long): Boolean =
+        InterceptScheduleEvaluator.shouldIntercept(
+            schedule = interceptSchedule,
+            now = LocalDate.now(ZoneId.systemDefault()),
+            nowMillis = nowMillis,
+            zoneId = ZoneId.systemDefault(),
+        )
 
     private fun execute(effect: Effect) {
         when (effect) {

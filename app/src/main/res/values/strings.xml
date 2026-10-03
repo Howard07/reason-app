@@ -6,6 +6,9 @@
     <string name="notification_title">运行中</string>
     <string name="notification_text">打开受监控的 app 时会请你写一个理由</string>
     <string name="notification_active_text">正在计时 · 剩余 %1$d 分钟</string>
+    <string name="notification_paused">已暂停拦截</string>
+    <string name="notification_paused_until">已暂停拦截 · 还剩 %1$d 分钟</string>
+    <string name="notification_rest_day">今日休息，不拦截</string>
     <string name="app_category_game">游戏</string>
     <string name="app_category_social">社交</string>
     <string name="app_category_media">影音</string>
