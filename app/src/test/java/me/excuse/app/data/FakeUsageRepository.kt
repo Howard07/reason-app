@@ -24,6 +24,7 @@ open class FakeUsageRepository : UsageRepositoryContract {
     override suspend fun setMonitored(packageName: String, appName: String, enabled: Boolean) = Unit
     override suspend fun reasonUseCountsTodayFor(packageName: String): Map<String, Int> = emptyMap()
     override suspend fun reasonUseCountToday(packageName: String, normalized: String) = 0
+    override suspend fun appUseCountTodayFor(packageName: String) = 0
     override suspend fun startSession(
         packageName: String,
         appName: String,

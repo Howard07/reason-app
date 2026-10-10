@@ -15,6 +15,7 @@ interface UsageRepositoryContract {
     suspend fun setMonitored(packageName: String, appName: String, enabled: Boolean)
     suspend fun reasonUseCountsTodayFor(packageName: String): Map<String, Int>
     suspend fun reasonUseCountToday(packageName: String, normalized: String): Int
+    suspend fun appUseCountTodayFor(packageName: String): Int
 
     suspend fun startSession(
         packageName: String,

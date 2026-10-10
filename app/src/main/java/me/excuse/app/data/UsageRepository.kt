@@ -69,6 +69,13 @@ class UsageRepository(private val db: AppDatabase) : UsageRepositoryContract {
         )
     }
 
+    override suspend fun appUseCountTodayFor(packageName: String): Int {
+        return db.usageSessions().appUseCountSince(
+            pkg = packageName,
+            sinceMillis = TimeUtil.startOfTodayMillis()
+        )
+    }
+
     override suspend fun startSession(
         packageName: String,
         appName: String,

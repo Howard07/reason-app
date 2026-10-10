@@ -50,6 +50,8 @@ class PromptPresenter(
     private val reasonUseCountsCache = DailyReasonCountsCache(REASONS_CACHE_TTL_MS)
     private val reasonUseCountsStates = HashMap<String, MutableState<Map<String, Int>>>()
     private val reasonsRefreshJobs = HashMap<String, Pair<Long, Job>>()
+    private val useCountTodayStates = HashMap<String, MutableState<Int>>()
+    private val useCountRefreshJobs = HashMap<String, Job>()
 
     private var foregroundStealState = PromptForegroundStealState()
     private var generation: Long = 0L
@@ -68,6 +70,7 @@ class PromptPresenter(
                     animateEntry = false,
                     appName = WARM_UP_APP_NAME,
                     reasonUseCountsToday = emptyMap(),
+                    useCountToday = 0,
                     onConfirm = { _, _ -> },
                     onCancel = {},
                     onInteraction = {},
@@ -349,6 +352,7 @@ class PromptPresenter(
         val pkg = submission.packageName
         val appName = appNameFor(pkg)
         val reasonUseCountsState = refreshReasonUseCounts(pkg)
+        val useCountTodayState = refreshUseCountToday(pkg)
         val submittingState = mutableStateOf(false)
 
         val animateEntry = !overlayManager.isShowing()
@@ -358,6 +362,7 @@ class PromptPresenter(
                 animateEntry = animateEntry,
                 appName = appName,
                 reasonUseCountsToday = reasonUseCountsState.value,
+                useCountToday = useCountTodayState.value,
                 submitting = submittingState.value,
                 returningHome = returningHome.value,
                 onInteraction = {
@@ -365,6 +370,7 @@ class PromptPresenter(
                         // 用户跨午夜继续输入时也刷新日期，不为这条提示增加常驻轮询。
                         if (reasonsRefreshJobs[pkg]?.first != TimeUtil.startOfTodayMillis()) {
                             refreshReasonUseCounts(pkg)
+                            refreshUseCountToday(pkg)
                         }
                         executeEffects(
                             stateMachine.onPromptInteraction(pkg, System.currentTimeMillis())
@@ -511,6 +517,23 @@ class PromptPresenter(
             pkg, normalized, TimeUtil.startOfTodayMillis(), System.currentTimeMillis(),
         )
         reasonUseCountsStates[pkg]?.value = updated
+    }
+
+    /** 该 app 今日已确认进入的次数；每次弹窗都重查（COUNT 很轻），0 时 overlay 隐藏。 */
+    private fun refreshUseCountToday(pkg: String): MutableState<Int> {
+        val state = useCountTodayStates.getOrPut(pkg) { mutableStateOf(0) }
+        useCountRefreshJobs[pkg]?.cancel()
+        useCountRefreshJobs[pkg] = scope.launch {
+            val count = try {
+                withContext(Dispatchers.IO) { repository.appUseCountTodayFor(pkg) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                0
+            }
+            state.value = count
+        }
+        return state
     }
 
     private fun refreshReasonUseCounts(pkg: String): MutableState<Map<String, Int>> {

@@ -49,6 +49,13 @@ interface UsageSessionDao {
     """)
     suspend fun reasonsForAppSince(pkg: String, sinceMillis: Long): List<String>
 
+    /** 该 app 今天已确认进入的次数（每次写理由确认插一条 session）。 */
+    @Query("""
+        SELECT COUNT(*) FROM usage_session
+        WHERE packageName = :pkg AND startTime >= :sinceMillis
+    """)
+    suspend fun appUseCountSince(pkg: String, sinceMillis: Long): Int
+
     @Query("""
         SELECT COUNT(*) FROM usage_session
         WHERE packageName = :pkg

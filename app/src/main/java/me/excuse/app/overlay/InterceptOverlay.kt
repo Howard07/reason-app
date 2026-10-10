@@ -121,6 +121,7 @@ fun InterceptOverlay(
     animateEntry: Boolean,
     appName: String,
     reasonUseCountsToday: Map<String, Int>,
+    useCountToday: Int = 0,
     submitting: Boolean = false,
     returningHome: Boolean = false,
     onConfirm: (reason: String, minutes: Int) -> Unit,
@@ -167,6 +168,7 @@ fun InterceptOverlay(
             InterceptOverlayContent(
                 appName = appName,
                 reasonUseCountsToday = reasonUseCountsToday,
+                useCountToday = useCountToday,
                 submitting = submitting,
                 returningHome = returningHome,
                 contentProgress = contentProgress,
@@ -187,6 +189,7 @@ fun InterceptOverlay(
 private fun InterceptOverlayContent(
     appName: String,
     reasonUseCountsToday: Map<String, Int>,
+    useCountToday: Int,
     submitting: Boolean,
     returningHome: Boolean,
     contentProgress: Float,
@@ -598,30 +601,46 @@ private fun InterceptOverlayContent(
                 Spacer(Modifier.height(contentTopSpacer))
 
                 // 拦截窗标题：把 app 名和"一个理由"拆开，长 app 名不会挤断句尾。
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                // 右侧放今日使用次数（弱信息，Muted 小字，0 次隐藏），不与长 app 名抢空间：
+                // 标题列占 weight(1f)，次数贴右对齐、最多占自身宽度。
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top
                 ) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = "给",
+                            fontSize = if (landscape) 13.sp else 17.sp,
+                            color = Muted,
+                            letterSpacing = 0.5.sp
+                        )
+                        Text(
+                            text = appName,
+                            fontSize = if (landscape) 28.sp else 42.sp,
+                            fontWeight = FontWeight.Light,
+                            color = Ink,
+                            lineHeight = if (landscape) 34.sp else 46.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "一个理由",
+                            fontSize = if (landscape) 20.sp else 26.sp,
+                            fontWeight = FontWeight.Light,
+                            color = Ink,
+                            lineHeight = if (landscape) 26.sp else 32.sp
+                        )
+                    }
+                    // 「今日第 n 次」= 本次若确认将是今天第 n 次进入（已确认次数 + 1），
+                    // 首次打开也成立；恒显示，不随次数隐藏。
                     Text(
-                        text = "给",
-                        fontSize = if (landscape) 13.sp else 17.sp,
+                        text = "今日第 ${useCountToday + 1} 次",
+                        fontSize = if (landscape) 11.sp else 13.sp,
                         color = Muted,
-                        letterSpacing = 0.5.sp
-                    )
-                    Text(
-                        text = appName,
-                        fontSize = if (landscape) 28.sp else 42.sp,
-                        fontWeight = FontWeight.Light,
-                        color = Ink,
-                        lineHeight = if (landscape) 34.sp else 46.sp,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "一个理由",
-                        fontSize = if (landscape) 20.sp else 26.sp,
-                        fontWeight = FontWeight.Light,
-                        color = Ink,
-                        lineHeight = if (landscape) 26.sp else 32.sp
+                        modifier = Modifier.padding(top = 4.dp, start = 8.dp)
                     )
                 }
 
