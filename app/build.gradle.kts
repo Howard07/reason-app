@@ -9,8 +9,26 @@ android {
     namespace = "me.excuse.app"
     compileSdk = 35
 
+    // 从 gradle 属性读取签名配置，密码不写死在仓库里。
+    // 首次使用前先在 ~/.gradle/gradle.properties 里补上这几行（见下方说明）。
+    val keystorePath = providers.gradleProperty("RELEASE_STORE_FILE").orNull
+    val keystorePassword = providers.gradleProperty("RELEASE_STORE_PASSWORD").orNull
+    val releaseKeyAlias = providers.gradleProperty("RELEASE_KEY_ALIAS").orNull
+    val releaseKeyPassword = providers.gradleProperty("RELEASE_KEY_PASSWORD").orNull
+
+    signingConfigs {
+        create("release") {
+            if (keystorePath != null) {
+                storeFile = file(keystorePath)
+                storePassword = keystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     defaultConfig {
-        applicationId = "me.excuse.app"
+        applicationId = "me.excuse.app.zh"
         minSdk = 29
         targetSdk = 35
         versionCode = 107
@@ -19,6 +37,7 @@ android {
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
