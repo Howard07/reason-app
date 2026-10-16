@@ -16,6 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.excuse.app.data.UsageRepositoryContract
+import me.excuse.app.overlay.CountdownOverlayManager
 import me.excuse.app.overlay.InterceptOverlay
 import me.excuse.app.overlay.OverlayManager
 import me.excuse.app.overlay.TimeUpOverlay
@@ -46,6 +47,7 @@ class PromptPresenter(
     private val debugLog: (String) -> Unit,
 ) {
     private val overlayManager = OverlayManager(context)
+    private val countdownOverlay = CountdownOverlayManager(context)
     private val appNameCache = HashMap<String, String>()
     private val reasonUseCountsCache = DailyReasonCountsCache(REASONS_CACHE_TTL_MS)
     private val reasonUseCountsStates = HashMap<String, MutableState<Map<String, Int>>>()
@@ -233,6 +235,7 @@ class PromptPresenter(
     fun pause() {
         // 取消后的 Home 交接仍可能持有可触摸窗口，即使状态机已在 Background。
         dismiss(immediately = true)
+        countdownOverlay.dismiss()
         promptTimeoutJob?.cancel()
         reasonsRefreshJobs.values.forEach { it.second.cancel() }
         reasonsRefreshJobs.clear()
@@ -240,11 +243,18 @@ class PromptPresenter(
 
     fun release() {
         pause()
+        countdownOverlay.release()
         overlayManager.release()
     }
 
     fun showTimeUp(pkg: String) {
-        val session = sessionStore.get(pkg) ?: return
+        val session = sessionStore.get(pkg)
+        if (session == null) {
+            android.util.Log.w("ReasonTimer", "showTimeUp: sessionStore.get($pkg) == null, abort")
+            return
+        }
+        // 到点：先收起倒计时圆环，再弹原「时间到了」拦截窗。
+        countdownOverlay.dismiss()
         returningHome.value = false
         val extendingState = mutableStateOf(false)
         val actualMinutes =
@@ -277,6 +287,21 @@ class PromptPresenter(
                         is TimeUpExtensionAttempt.Applied -> {
                             extendingState.value = true
                             executeEffects(attempt.effects)
+                            // 延期成功：重新显示倒计时圆环，用延后的 deadline。
+                            val extended = attempt.session
+                            countdownOverlay.show(
+                                plannedMinutes = extended.plannedMinutes,
+                                deadlineMillis =
+                                    extended.startedAt + extended.plannedMinutes * 60_000L,
+                                onDeadline = {
+                                    executeEffects(
+                                        stateMachine.onSessionTimeElapsed(
+                                            pkg,
+                                            System.currentTimeMillis(),
+                                        )
+                                    )
+                                },
+                            )
                         }
                         is TimeUpExtensionAttempt.TimerMissing -> {
                             debugLog("time-up extension rejected: missing timer pkg=$pkg")
@@ -293,7 +318,9 @@ class PromptPresenter(
                 },
             )
         }
+        android.util.Log.w("ReasonTimer", "showTimeUp: overlayManager.show returned shown=$shown")
         if (!shown) {
+            android.util.Log.w("ReasonTimer", "showTimeUp: overlay show FAILED, reset + sendHome pkg=$pkg")
             debugLog("time-up overlay show failed pkg=$pkg")
             executeEffects(stateMachine.reset(System.currentTimeMillis()))
             sendHome(pkg)
@@ -449,6 +476,18 @@ class PromptPresenter(
             }
             insertedSession = session
             rememberReasonUse(pkg, reason)
+
+            // 悬浮倒计时圆环：写理由确认进入后显示，到点归零时由 onDeadline 触发弹拦截窗。
+            // 圆环的倒计时用 Handler + 绝对时间戳驱动，不受 ColorOS 冻结协程影响。
+            countdownOverlay.show(
+                plannedMinutes = plannedMinutes,
+                deadlineMillis = session.startedAt + plannedMinutes * 60_000L,
+                onDeadline = {
+                    executeEffects(
+                        stateMachine.onSessionTimeElapsed(pkg, System.currentTimeMillis())
+                    )
+                },
+            )
 
             if (!isCurrent(submission)) {
                 finishStoredSessionNow(pkg, overran = false)

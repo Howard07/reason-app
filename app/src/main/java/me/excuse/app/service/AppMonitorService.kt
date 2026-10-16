@@ -83,6 +83,7 @@ class AppMonitorService : LifecycleService() {
     private var scheduleSubscription: Job? = null
 
     private var screenReceiver: BroadcastReceiver? = null
+    private var deadlineReceiver: BroadcastReceiver? = null
 
     private val stateMachine = InterceptStateMachine()
     private val homePackage by lazy {
@@ -104,10 +105,12 @@ class AppMonitorService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         val app = application as AppServices
+        val deadlineAlarm = SessionDeadlineAlarm(this)
         sessionStore = SessionStore(
             timer = SessionTimer(lifecycleScope),
             writer = app.repository,
             writerScope = sessionWriterScope,
+            deadlineAlarm = deadlineAlarm,
             onWriteFailure = { operation, error ->
                 Log.e(DIAG_TAG, "$operation failed; queued for bounded retry", error)
             },
@@ -223,6 +226,26 @@ class AppMonitorService : LifecycleService() {
                 registerReceiver(receiver, filter)
             }
         } catch (_: Exception) {}
+
+        // 到点兜底：精确闹钟触发时（进程可能刚被 ROM 冻结后唤醒），直接推进状态机。
+        try {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (intent.action != SessionDeadlineAlarm.ACTION_SESSION_DEADLINE) return
+                    val pkg = intent.getStringExtra(SessionDeadlineAlarm.EXTRA_PACKAGE_NAME)
+                        ?: return
+                    Log.w("ReasonTimer", "deadline alarm fired pkg=$pkg")
+                    execute(stateMachine.onSessionTimeElapsed(pkg, System.currentTimeMillis()))
+                }
+            }
+            deadlineReceiver = receiver
+            val filter = IntentFilter(SessionDeadlineAlarm.ACTION_SESSION_DEADLINE)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+        } catch (_: Exception) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -247,6 +270,10 @@ class AppMonitorService : LifecycleService() {
             try { unregisterReceiver(it) } catch (_: Exception) {}
         }
         screenReceiver = null
+        deadlineReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+        }
+        deadlineReceiver = null
         monitoredSubscription?.cancel()
         scheduleSubscription?.cancel()
         pollJob?.cancel()
@@ -448,6 +475,10 @@ class AppMonitorService : LifecycleService() {
                 // 兜底：事件流如果错过了 RESUMED（部分 ROM / 某些场景下），sticky 会卡在 null。
                 // 查 UsageStats 看看 OS 当前认为前台是什么，必要时补一脚状态机。
                 maybeReconcileWithUsageStats(observedNow)
+
+                // 兜底：SessionTimer 的 delay 协程在部分 ROM 上会被省电冻结、到点不回调。
+                // 这里用墙钟绝对时间每轮复查，发现到期就主动推进状态机，不依赖 delay。
+                maybeAdvanceElapsedSessions(observedNow)
             } catch (t: Exception) {
                 debugLog { "poll exception=${t::class.java.simpleName}: ${t.message}" }
             }
@@ -537,6 +568,29 @@ class AppMonitorService : LifecycleService() {
         }
         foregroundInterpreter.forceForeground(realFg, observedAt = candidate.lastTimeUsed)
         executeTick(realFg, applyNow, entryEdge = realFgIsMonitored)
+    }
+
+    /**
+     * 兜底推进到点 session：SessionTimer 的 delay 协程在部分 ROM（ColorOS 等）的省电
+     * 策略下会被冻结、到点不回调。这里不依赖任何定时器，直接用墙钟绝对时间复查
+     * [SessionStore] 里挂着的 session，发现已到 deadline 就触发与 delay 相同的
+     * [InterceptStateMachine.onSessionTimeElapsed]。
+     *
+     * 幂等：onSessionTimeElapsed 内部只在 state 仍是 InSession/SessionLeaving 且 pkg 匹配时
+     * 才会把状态推进到 TimeUp；推进后本方法下一轮不再命中，不会重复弹窗。
+     */
+    private fun maybeAdvanceElapsedSessions(now: Long) {
+        for (session in sessionStore.all()) {
+            val deadline = session.startedAt + session.plannedMinutes * 60_000L
+            if (now < deadline) continue
+            val state = stateMachine.state
+            val stillActive =
+                (state as? InterceptStateMachine.State.InSession)?.pkg == session.packageName ||
+                    (state as? InterceptStateMachine.State.SessionLeaving)?.pkg == session.packageName
+            if (!stillActive) continue
+            Log.w("ReasonTimer", "deadline fallback hit pkg=${session.packageName} now=$now deadline=$deadline")
+            execute(stateMachine.onSessionTimeElapsed(session.packageName, now))
+        }
     }
 
     private suspend fun queryCurrentForegroundFromStats(now: Long): UsageStatsForeground? =
@@ -650,6 +704,7 @@ class AppMonitorService : LifecycleService() {
                 if (ensureMonitoringPermissionsOrStop()) promptPresenter.showPrompt(effect.pkg)
             }
             is Effect.ShowTimeUp -> {
+                Log.w("ReasonTimer", "Effect.ShowTimeUp pkg=${effect.pkg}")
                 if (ensureMonitoringPermissionsOrStop()) promptPresenter.showTimeUp(effect.pkg)
             }
             is Effect.FinishSession -> finishSession(effect.pkg, effect.endedAt, effect.overran)
@@ -737,14 +792,17 @@ class AppMonitorService : LifecycleService() {
     }
 
     private fun ensureMonitoringPermissionsOrStop(): Boolean {
-        val ready = try {
-            MonitoringPermissions.current(this).isReady
+        val state = try {
+            MonitoringPermissions.current(this)
         } catch (error: RuntimeException) {
             Log.e(DIAG_TAG, "monitoring permission check failed", error)
-            false
+            MonitoringPermissionState(usageAccess = false, overlay = false, notification = false)
         }
-        if (!ready) stopForMissingPermissions()
-        return ready
+        if (!state.isReady) {
+            Log.w("ReasonTimer", "permissions NOT ready usage=${state.usageAccess} overlay=${state.overlay} notif=${state.notification}")
+            stopForMissingPermissions()
+        }
+        return state.isReady
     }
 
     private fun stopForMissingPermissions() {
@@ -848,6 +906,23 @@ class AppMonitorService : LifecycleService() {
                 .thenByDescending { it.eventType }
 
         fun start(context: Context) {
+            val ready = try {
+                MonitoringPermissions.current(context).isReady
+            } catch (_: RuntimeException) {
+                false
+            }
+            if (!ready) return
+            val intent = Intent(context, AppMonitorService::class.java)
+            context.startForegroundService(intent)
+        }
+
+        /**
+         * 到点闹钟触发时调用：把服务拉起来。进程还活着时动态 receiver 已直接处理；
+         * 进程被 ROM 杀死时，这里负责冷启动，让服务重新评估前台状态并兜底处理。
+         * 注意：进程被杀时正在进行的 session 已随 onDestroy 结束，冷启动无法恢复
+         * 一个不存在的 session 的超时窗，此时仅保证服务回到正确的前台监控状态。
+         */
+        fun startForDeadline(context: Context, packageName: String) {
             val ready = try {
                 MonitoringPermissions.current(context).isReady
             } catch (_: RuntimeException) {

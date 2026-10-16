@@ -21,6 +21,7 @@ class SessionStore(
     },
     private val retryBackoffMillis: List<Long> = listOf(250L, 1_000L, 5_000L),
     private val waitBeforeRetry: suspend (Long) -> Unit = { delay(it) },
+    private val deadlineAlarm: SessionDeadlineAlarm? = null,
 ) {
     data class Session(
         val sessionId: Long,
@@ -80,6 +81,8 @@ class SessionStore(
         check(!shuttingDown) { "Session store has stopped" }
         val sessionId = writer.startSession(packageName, appName, reason, plannedMinutes)
         val active = timer.start(sessionId, packageName, plannedMinutes, onElapsed)
+        // 到点兜底：注册精确闹钟，绕过 ROM 对 delay 协程的冻结。
+        deadlineAlarm?.schedule(packageName, active.startTime + plannedMinutes * 60_000L)
         return Session(
             sessionId = sessionId,
             packageName = packageName,
@@ -112,6 +115,8 @@ class SessionStore(
             extensionCount = active.extensionCount,
         )
         sessions[packageName] = updated
+        // 延期改变 deadline，重新注册精确闹钟兜底。
+        deadlineAlarm?.schedule(packageName, updated.startedAt + updated.plannedMinutes * 60_000L)
         // 用绝对值写入，让 service 销毁时重放一个已经成功、但尚未来得及从队列移除的
         // 延期操作仍然幂等；增量 UPDATE 在这个窗口里会平白多加五分钟。
         enqueue(PendingWrite.Extend(updated.sessionId, updated.plannedMinutes))
@@ -129,6 +134,7 @@ class SessionStore(
             if (shuttingDown) return
             shuttingDown = true
             active.forEach { session ->
+                deadlineAlarm?.cancel(session.packageName)
                 pendingWrites.addLast(
                     queued(
                         PendingWrite.Finish(
@@ -161,6 +167,7 @@ class SessionStore(
     private fun remove(packageName: String): Session? {
         val session = sessions.remove(packageName) ?: return null
         timer.cancel(packageName)
+        deadlineAlarm?.cancel(packageName)
         return session
     }
 

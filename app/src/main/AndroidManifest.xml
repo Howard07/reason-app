@@ -9,6 +9,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 到点兜底：精确闹钟。API 31-32 用 SCHEDULE_EXACT_ALARM（需用户授权）；
+         API 33+ 用 USE_EXACT_ALARM（定时器类 app 免授权，受应用商店用途审核）。
+         两者同时声明，系统按 SDK 版本取用对应权限。 -->
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.USE_EXACT_ALARM"
+        android:minSdkVersion="33" />
 
     <queries>
         <!-- Recents 可能只切换 Home 的生命周期；识别默认桌面以恢复仍 resumed 的目标。 -->
@@ -92,5 +101,10 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".service.DeadlineAlarmReceiver"
+            android:enabled="true"
+            android:exported="false" />
     </application>
 </manifest>

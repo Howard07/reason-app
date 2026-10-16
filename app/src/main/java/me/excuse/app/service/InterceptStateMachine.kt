@@ -376,6 +376,7 @@ class InterceptStateMachine(
     }
 
     fun onSessionTimeElapsed(pkg: String, now: Long): List<Effect> {
+        android.util.Log.w("ReasonTimer", "onSessionTimeElapsed pkg=$pkg state=${state.javaClass.simpleName}")
         return when (val s = state) {
             is State.InSession -> {
                 if (s.pkg != pkg) return emptyList()

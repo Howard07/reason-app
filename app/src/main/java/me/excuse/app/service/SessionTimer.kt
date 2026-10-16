@@ -1,5 +1,6 @@
 package me.excuse.app.service
 
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -33,7 +34,9 @@ class SessionTimer(
         val startTime = wallClockMillis()
         val startedAtMonotonic = monotonicMillis()
         val job = scope.launch {
+            Log.w("ReasonTimer", "timer started pkg=$packageName minutes=$plannedMinutes")
             suspendFor(plannedMinutes * 60_000L)
+            Log.w("ReasonTimer", "timer elapsed pkg=$packageName -> calling onElapsed")
             onElapsed()
         }
         val active = Active(
