@@ -151,39 +151,6 @@ class PromptReturnPolicyTest {
     }
 
     @Test
-    fun recentsCancelKeepsUsageStatsFallbackAvailableForAMissedResume() {
-        val launcher = "com.example.launcher"
-        val stateMachine = InterceptStateMachine()
-        assertTrue(
-            stateMachine.tick(target, monitored, now = 1_000L, entryEdge = true)
-                .any { it is InterceptStateMachine.Effect.ShowPrompt },
-        )
-        assertEquals(emptyList<InterceptStateMachine.Effect>(), stateMachine.tick(launcher, monitored, 1_100L))
-
-        stateMachine.onPromptCancelled(target, now = 1_200L)
-        assertEquals(HomeRequestPlan(guardPackage = null), planHomeFor(launcher))
-
-        val missedResume = UsageStatsForeground(packageName = target, lastTimeUsed = 1_300L)
-        assertTrue(
-            shouldApplyUsageStatsForeground(
-                state = stateMachine.state,
-                stickyPackage = launcher,
-                lastUsageEvidenceAt = 1_100L,
-                eventsQueriedThrough = 1_400L,
-                candidate = missedResume,
-                monitored = monitored,
-            )
-        )
-        val reentry = stateMachine.tick(
-            foreground = missedResume.packageName,
-            monitored = monitored,
-            now = 1_400L,
-            entryEdge = true,
-        )
-        assertEquals(1, reentry.count { it is InterceptStateMachine.Effect.ShowPrompt })
-    }
-
-    @Test
     fun confirmationPlanFinishesInsteadOfLaunchingARecentlyRemovedTarget() {
         assertEquals(
             PromptConfirmationPlan(

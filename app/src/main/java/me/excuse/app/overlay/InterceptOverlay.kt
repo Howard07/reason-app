@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import android.view.HapticFeedbackConstants
+import android.widget.Toast
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.Spring
@@ -15,9 +16,12 @@ import androidx.compose.animation.core.rememberTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.indication
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,6 +40,7 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -73,12 +78,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.boundsInRoot
@@ -87,6 +95,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -94,6 +103,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -202,6 +212,7 @@ private fun InterceptOverlayContent(
     var customMinutes by remember { mutableIntStateOf(DEFAULT_CUSTOM_MINUTES) }
     var reasonFocused by remember { mutableStateOf(false) }
     var reason by remember { mutableStateOf("") }
+    val clipboardManager = LocalClipboardManager.current
 
     val isCustomMode = selectedPreset == null
     val finalMinutes = selectedPreset ?: customMinutes
@@ -649,7 +660,8 @@ private fun InterceptOverlayContent(
                 // TextField + 可变高错误区包成外层的一个 child，避免错误区高度为 0 时
                 // Arrangement.spacedBy 仍多算一道 gap，改变正常态布局。
                 Column {
-                    OutlinedTextField(
+                    Box {
+                        OutlinedTextField(
                         value = reason,
                         onValueChange = { input ->
                             val lineBreakIndex = input.indexOfAny(charArrayOf('\n', '\r'))
@@ -693,6 +705,39 @@ private fun InterceptOverlayContent(
                             unfocusedIndicatorColor = Line
                         )
                     )
+
+                        // 复制理由图标：理由非空时显示在输入框右上角，点一下把已填理由写入剪贴板，
+                        // 避免进入目标 app 后重打 / 重说一遍。主动触发，不自动覆盖剪贴板。
+                        if (reason.isNotBlank()) {
+                            val copyColor = if (busy) Muted else Ink
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(top = 12.dp, end = 12.dp)
+                                    .size(32.dp)
+                                    .clip(RoundedCornerShape(0.dp))
+                                    .clickable(
+                                        enabled = !busy,
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                        onClick = {
+                                            val trimmed = reason.trim()
+                                            if (trimmed.isNotEmpty()) {
+                                                clipboardManager.setText(AnnotatedString(trimmed))
+                                                Toast.makeText(
+                                                    context,
+                                                    "已复制理由",
+                                                    Toast.LENGTH_SHORT,
+                                                ).show()
+                                            }
+                                        },
+                                    ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                CopyGlyph(color = copyColor)
+                            }
+                        }
+                    }
 
                     val duplicateMessageHeight by animateDpAsState(
                         targetValue = if (isDuplicate) sectionGap + 20.dp else 0.dp,
@@ -904,6 +949,51 @@ private fun InterceptOverlayContent(
 private fun rememberOverlayPane(content: @Composable () -> Unit): @Composable () -> Unit {
     val currentContent = rememberUpdatedState(content)
     return remember { movableContentOf { currentContent.value() } }
+}
+
+/**
+ * 「复制」图标：两个错位叠放的小方块，前面的方块带一个左上的角标，隐喻「复制」。
+ * 自绘 SVG 而非图标库，避免为一个小图标引入 material-icons-extended 依赖，
+ * 视觉沿用项目的极简描边风（细描边 + 方角）。
+ */
+@Composable
+private fun CopyGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier.size(18.dp)) {
+        val stroke = 1.6.dp.toPx()
+        val cap = StrokeCap.Square
+        // 后面的方块（右上，偏移）
+        val backLeft = 5.5.dp.toPx()
+        val backTop = 2.dp.toPx()
+        val backSize = 10.dp.toPx()
+        // 前面的方块（左下）
+        val frontLeft = 2.5.dp.toPx()
+        val frontTop = 6.dp.toPx()
+        val frontSize = 10.dp.toPx()
+
+        // 后块
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(backLeft, backTop),
+            size = Size(backSize, backSize),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(0f, 0f),
+            style = Stroke(width = stroke),
+        )
+        // 前块（白底，盖住后块重叠部分，形成「前面」的层次）
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(frontLeft, frontTop),
+            size = Size(frontSize, frontSize),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(0f, 0f),
+            style = Stroke(width = stroke),
+        )
+        // 前块左上角的小方点（复制角标）
+        val dot = 2.dp.toPx()
+        drawRect(
+            color = color,
+            topLeft = Offset(frontLeft, frontTop),
+            size = Size(dot, dot),
+        )
+    }
 }
 
 @Composable

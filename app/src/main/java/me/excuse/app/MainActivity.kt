@@ -68,7 +68,8 @@ class MainActivity : ComponentActivity() {
             fun computeOk(): Boolean =
                 PermissionUtils.hasUsageAccess(ctx) &&
                         PermissionUtils.hasOverlay(ctx) &&
-                        PermissionUtils.hasNotification(ctx)
+                        PermissionUtils.hasNotification(ctx) &&
+                        PermissionUtils.hasAccessibility(ctx)
 
             // 把权限状态变成真正的 Compose state，否则 MainActivity 永远不会重组
             var permissionsOk by remember { mutableStateOf(computeOk()) }

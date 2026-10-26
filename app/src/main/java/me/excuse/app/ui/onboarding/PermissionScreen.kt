@@ -71,12 +71,15 @@ fun PermissionScreen(
     var usage by remember { mutableStateOf(PermissionUtils.hasUsageAccess(context)) }
     var overlay by remember { mutableStateOf(PermissionUtils.hasOverlay(context)) }
     var notif by remember { mutableStateOf(PermissionUtils.hasNotification(context)) }
+    // 无障碍是必需权限：它是前台监控的唯一传感器，也是后台被杀后唯一能自愈的通道。
+    var accessibility by remember { mutableStateOf(PermissionUtils.hasAccessibility(context)) }
     var notificationRequestAttempted by rememberSaveable { mutableStateOf(false) }
 
     fun refresh() {
         usage = PermissionUtils.hasUsageAccess(context)
         overlay = PermissionUtils.hasOverlay(context)
         notif = PermissionUtils.hasNotification(context)
+        accessibility = PermissionUtils.hasAccessibility(context)
     }
 
     // 切回 app 时刷新一次（绝大多数情况这里就够了）
@@ -103,7 +106,7 @@ fun PermissionScreen(
         refresh()
     }
 
-    val coreOk = usage && overlay && notif
+    val coreOk = usage && overlay && notif && accessibility
     val isAggressiveRom = PermissionUtils.isVendorRomLikelyAggressive()
     val isXiaomiRom = PermissionUtils.isXiaomiRom()
 
@@ -144,6 +147,12 @@ fun PermissionScreen(
                         desc = "用来盖在被监控 app 上弹问题。这个窗禁止截屏录屏，理由不会被录进去。",
                         granted = overlay,
                         onGo = { PermissionUtils.openOverlaySettings(context) }
+                    )
+                    PermissionItem(
+                        title = "无障碍服务",
+                        desc = "这是监控的传感器和保命通道：切换 app 的瞬间由它立刻通知我们；后台进程被系统清掉之后，也是系统通过它把监控重新拉起来。不开它，监控无法工作。\n\n它只读取「当前窗口属于哪个应用」，读不到屏幕内容、聊天记录和输入，也不截图、不联网。\n\n系统设置 → 无障碍 → 已下载的服务 → 给一个理由",
+                        granted = accessibility,
+                        onGo = { PermissionUtils.openAccessibilitySettings(context) },
                     )
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         val notificationAction = notificationPermissionAction(
@@ -238,7 +247,7 @@ fun PermissionScreen(
                 Button(
                     onClick = {
                         refresh()
-                        if (usage && overlay && notif) onAllGranted()
+                        if (usage && overlay && notif && accessibility) onAllGranted()
                     },
                     enabled = coreOk,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),

@@ -17,6 +17,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
@@ -41,17 +42,16 @@ import me.excuse.app.service.InterceptStateMachine.Effect
 import java.time.LocalDate
 import java.time.ZoneId
 
-/** 把 UsageEvents 解释成 sticky 前台并执行状态机 effect；窗口竞争交给 [PromptPresenter]。 */
+/**
+ * 监控中枢：前台事实来自 [AccessibilityForegroundHub]（无障碍窗口事件），
+ * 状态机 effect 的窗口竞争交给 [PromptPresenter]。
+ *
+ * UsageStats 在这里只剩一个职责：检测（重）启动时对过去 10 秒做一次快照播种，
+ * 让 sticky 与现实对齐；之后的每一个前台变化都由无障碍事件驱动，不再轮询。
+ */
 class AppMonitorService : LifecycleService() {
 
     private data class UsageEventSnapshot(
-        val timestamp: Long,
-        val eventType: Int,
-        val packageName: String,
-        val className: String?,
-    )
-
-    private data class EventKey(
         val timestamp: Long,
         val eventType: Int,
         val packageName: String,
@@ -72,13 +72,17 @@ class AppMonitorService : LifecycleService() {
     private val monitoredReady = CompletableDeferred<Unit>()
     private var pollJob: Job? = null
     private var notifJob: Job? = null
-    private var stoppingForMissingPermissions = false
     private var startupSeedAttempted = false
+
+    /** 权限/无障碍缺失时的降级快照；null 表示处于正常工作状态。见 [ensureMonitoringPermissions]。 */
+    private var degradedState: MonitoringPermissionState? = null
+
+    private val foregroundHub = AccessibilityForegroundHub
 
     @Volatile private var monitoredCache: Set<String> = emptySet()
     private var monitoredSubscription: Job? = null
 
-    /** 拦截调度配置的最新快照，每轮 poll 据此重算「今天拦不拦」。 */
+    /** 拦截调度配置的最新快照，每次 tick 据此重算「今天拦不拦」。 */
     @Volatile private var interceptSchedule: InterceptSchedule = InterceptSchedule()
     private var scheduleSubscription: Job? = null
 
@@ -86,21 +90,37 @@ class AppMonitorService : LifecycleService() {
     private var deadlineReceiver: BroadcastReceiver? = null
 
     private val stateMachine = InterceptStateMachine()
-    private val homePackage by lazy {
-        packageManager.resolveActivity(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0,
-        )?.activityInfo?.packageName
+
+    /**
+     * 无障碍通道的包级前台变化 → 状态机。sticky 已由 hub 更新，这里只决定要不要驱动。
+     *
+     * 息屏 / 降级期间不驱动状态机：那两段里事件流与现实脱钩（锁屏窗口搅动），
+     * sticky 留给亮屏时的播种重新校准。
+     */
+    private val foregroundChangeListener: (AccessibilityForegroundTracker.Change) -> Unit =
+        listener@{ change ->
+            if (degradedState != null) return@listener
+            if (pollJob?.isActive != true) return@listener
+            if (monitoredCache.isEmpty() &&
+                sessionStore.all().isEmpty() &&
+                stateMachine.state !is InterceptStateMachine.State.Prompting
+            ) {
+                return@listener
+            }
+            debugLog {
+                "a11y foreground -> ${change.packageName} edge=${change.isEntryEdge} " +
+                    foregroundHub.tracker.debugState()
+            }
+            executeTick(change.packageName, change.at, change.isEntryEdge)
+            // 有真实切换时顺手推进到点 session，不必等下一个维护 tick。
+            maybeAdvanceElapsedSessions(change.at)
+        }
+
+    /** 无障碍绑定状态变化就是权限门控的输入：断开即降级，重连即自愈。 */
+    private val connectionListener: (Boolean) -> Unit = { connected ->
+        Log.w(DIAG_TAG, "accessibility connection changed: connected=$connected")
+        ensureMonitoringPermissions()
     }
-    private val foregroundInterpreter = ForegroundEventInterpreter(
-        PAUSE_REENTRY_GAP_MS,
-        isHomePackage = { it == homePackage },
-    )
-    private val postHomeEventGuard = PostHomeEventGuard(POST_HOME_USAGE_STATS_SUPPRESS_MS)
-    private var lastQueryTime = 0L
-    private var lastUsageStatsCheckAt = 0L
-    private val seenEvents = LinkedHashMap<EventKey, Long>()
-    private var sessionLeaveJob: Job? = null
-    private var sessionLeaveGeneration = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -122,20 +142,21 @@ class AppMonitorService : LifecycleService() {
             stateMachine = stateMachine,
             sessionStore = sessionStore,
             monitoredPackages = { monitoredCache },
-            foregroundPackage = { foregroundInterpreter.stickyPackageName },
-            foregroundClassName = { foregroundInterpreter.stickyClassName },
-            hasPendingPauseFor = { foregroundInterpreter.hasPendingPauseFor(it) },
+            foregroundPackage = { foregroundHub.tracker.stickyPackageName },
+            foregroundClassName = { foregroundHub.tracker.stickyClassName },
+            // 无障碍事件是即时的包级切换，不存在 UsageStats 那种「PAUSED 未决」中间态。
+            hasPendingPauseFor = { false },
             executeEffects = { execute(it) },
-            beforeSendHome = { targetPackage, now ->
+            beforeSendHome = { _, _ ->
                 debugLog {
-                    "sendHome state=${stateMachine.state} ${foregroundInterpreter.debugState()}"
+                    "sendHome state=${stateMachine.state} ${foregroundHub.tracker.debugState()}"
                 }
-                foregroundInterpreter.forceForeground(null, observedAt = now)
-                postHomeEventGuard.markHome(targetPackage, now)
+                // 主动送 Home 后 launcher 的窗口事件随即到达；先把 sticky 置空，
+                // 事件到达时 sticky 无变化，就不会再驱动出多余的状态机动作。
+                foregroundHub.tracker.forceForeground(null)
             },
-            afterReturnHome = { now ->
-                foregroundInterpreter.forceForeground(null, observedAt = now)
-                postHomeEventGuard.completeHome(now)
+            afterReturnHome = { _ ->
+                foregroundHub.tracker.forceForeground(null)
             },
             debugLog = { message -> debugLog { message } },
         )
@@ -166,7 +187,7 @@ class AppMonitorService : LifecycleService() {
             try {
                 app.repository.monitoredApps().collect { list ->
                     val enabledApps = list.filter { it.enabled }
-                    // monitoredCache 一旦发布，下一次轮询就可能马上触发 prompt；先填名字，
+                    // monitoredCache 一旦发布，下一次事件就可能马上触发 prompt；先填名字，
                     // 避免首个 prompt 在主线程冷调 PackageManager。
                     enabledApps.forEach { monitored ->
                         promptPresenter.cacheAppName(monitored.packageName, monitored.appName)
@@ -183,7 +204,7 @@ class AppMonitorService : LifecycleService() {
                     }
                     // 只主动处理“移除正在运行的目标”。新增 app 时 sticky 可能仍是进入
                     // Reason 主界面前的旧值，拿它主动 tick 会在设置页制造幽灵 prompt。
-                    // 这里传 null 只结束旧 session；真实的新前台仍交给 UsageEvents。
+                    // 这里传 null 只结束旧 session；真实的新前台仍交给无障碍事件。
                     if (activePackage != null && activePackage in removed) {
                         executeTick(
                             foreground = null,
@@ -200,9 +221,13 @@ class AppMonitorService : LifecycleService() {
             }
         }
 
+        foregroundHub.addChangeListener(foregroundChangeListener)
+        foregroundHub.addConnectionListener(connectionListener)
+
         permissionObserver = MonitoringPermissionObserver(this) {
             lifecycleScope.launch(Dispatchers.Main.immediate) {
-                ensureMonitoringPermissionsOrStop()
+                // 权限变化同时承担两个方向：撤销时进入降级，恢复时自愈。
+                ensureMonitoringPermissions()
             }
         }.also { it.start() }
 
@@ -220,11 +245,9 @@ class AppMonitorService : LifecycleService() {
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_SCREEN_ON)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(receiver, filter)
-            }
+            ContextCompat.registerReceiver(
+                this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
         } catch (_: Exception) {}
 
         // 到点兜底：精确闹钟触发时（进程可能刚被 ROM 冻结后唤醒），直接推进状态机。
@@ -240,22 +263,26 @@ class AppMonitorService : LifecycleService() {
             }
             deadlineReceiver = receiver
             val filter = IntentFilter(SessionDeadlineAlarm.ACTION_SESSION_DEADLINE)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(receiver, filter)
-            }
+            // 自定义 action 属于非系统广播，API 34+ 强制要求显式声明导出状态；
+            // ContextCompat 在低版本上退化为带 signature 权限的等价保护。
+            ContextCompat.registerReceiver(
+                this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
         } catch (_: Exception) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        if (!ensureMonitoringPermissionsOrStop()) return START_NOT_STICKY
-        val pm = getSystemService(PowerManager::class.java)
-        val interactive = pm?.isInteractive ?: true
-        if (interactive) {
-            resumeDetection()
+        // 每次被拉起都续排看门狗：即使上一次的闹钟被 ROM 清掉，这一句也能补回来。
+        MonitorWatchdog.schedule(this)
+        if (ensureMonitoringPermissions()) {
+            val pm = getSystemService(PowerManager::class.java)
+            val interactive = pm?.isInteractive ?: true
+            if (interactive) {
+                resumeDetection()
+            }
         }
+        // 降级时也返回 STICKY。降级是「权限/无障碍暂时缺失」，不是「应该放弃重启资格」。
         return START_STICKY
     }
 
@@ -265,6 +292,8 @@ class AppMonitorService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        foregroundHub.removeChangeListener(foregroundChangeListener)
+        foregroundHub.removeConnectionListener(connectionListener)
         if (::permissionObserver.isInitialized) permissionObserver.stop()
         screenReceiver?.let {
             try { unregisterReceiver(it) } catch (_: Exception) {}
@@ -287,9 +316,9 @@ class AppMonitorService : LifecycleService() {
     }
 
     private fun resumeDetection() {
-        if (!ensureMonitoringPermissionsOrStop()) return
+        if (!ensureMonitoringPermissions()) return
         if (pollJob?.isActive != true) {
-            pollJob = lifecycleScope.launch { pollLoop() }
+            pollJob = lifecycleScope.launch { maintenanceLoop() }
         }
         if (notifJob?.isActive != true) {
             notifJob = lifecycleScope.launch { notificationTickLoop() }
@@ -300,9 +329,17 @@ class AppMonitorService : LifecycleService() {
         val now = System.currentTimeMillis()
         execute(stateMachine.reset(now))
         promptPresenter.pause()
-        foregroundInterpreter.reset()
-        postHomeEventGuard.reset()
-        seenEvents.clear()
+        foregroundHub.tracker.reset()
+        suspendPolling()
+    }
+
+    /**
+     * 只停维护与通知循环，不动状态机和进行中的 session。
+     *
+     * [pauseDetection] 语义是「用户息屏 / 主动离开」，重置状态机是对的；
+     * 但权限/无障碍抖动只该让监控暂停，不该被当成「用户已经不在用了」而结束 session。
+     */
+    private fun suspendPolling() {
         pollJob?.cancel()
         pollJob = null
         notifJob?.cancel()
@@ -311,7 +348,12 @@ class AppMonitorService : LifecycleService() {
 
     private suspend fun notificationTickLoop() {
         while (currentCoroutineActive()) {
-            if (!ensureMonitoringPermissionsOrStop()) return
+            if (!ensureMonitoringPermissions()) {
+                // 降级期间保留低频复查。权限恢复没有广播可听，只能自己回来问；
+                // 这里若 return 退出循环，就再没有任何东西把检测叫醒了。
+                delay(DEGRADED_PERMISSION_CHECK_MS)
+                continue
+            }
             val hasActiveSession = sessionStore.all().isNotEmpty()
             if (hasActiveSession) {
                 refreshNotification()
@@ -331,8 +373,10 @@ class AppMonitorService : LifecycleService() {
             .filter { (it.startedAt + it.plannedMinutes * 60_000L) > now }
             .minByOrNull { it.startedAt + it.plannedMinutes * 60_000L }
 
-        // 文案优先级：进行中 session（已确认，要自然走完）> 临时暂停 > 今日休息 > 默认。
+        // 文案优先级：降级（最需要解释"为什么没拦"）> 进行中 session（已确认，要自然走完）
+        // > 临时暂停 > 今日休息 > 默认。
         val text = when {
+            degradedState != null -> getString(R.string.notification_degraded)
             nearest != null -> {
                 val remainMs = (nearest.startedAt + nearest.plannedMinutes * 60_000L) - now
                 val remainMin = ((remainMs + 59_999L) / 60_000L).toInt().coerceAtLeast(1)
@@ -357,217 +401,112 @@ class AppMonitorService : LifecycleService() {
         } catch (_: Exception) {}
     }
 
-    private suspend fun pollLoop() {
-        // Room cleanup 和 monitored Flow 首帧都完成后才允许接收确认；否则清理 UPDATE
+    /**
+     * 主循环只剩两件不依赖事件流的事：
+     * 1. 启动时播种 —— 用 UsageStats 快照把 sticky 校准到现实（之后全靠无障碍事件）；
+     * 2. 低频维护 —— 纯内存的到点 session 复查，防 SessionTimer 的 delay 协程被
+     *    省电策略冻结（ColorOS 等）。无任何跨进程调用，1s 一次的成本可以忽略。
+     */
+    private suspend fun maintenanceLoop() {
+        // Room cleanup 和 monitored Flow 首帧都完成后才允许播种；否则清理 UPDATE
         // 可能误伤刚插入的新 session，seed 也可能在空名单下把真实前台吃掉。
         startupCleanupJob.join()
         monitoredReady.await()
-        if (!ensureMonitoringPermissionsOrStop()) return
+        if (!ensureMonitoringPermissions()) return
+        seedForeground()
+        while (currentCoroutineActive()) {
+            try {
+                maybeAdvanceElapsedSessions(System.currentTimeMillis())
+            } catch (t: Exception) {
+                debugLog { "maintenance exception=${t::class.java.simpleName}: ${t.message}" }
+            }
+            delay(MAINTENANCE_TICK_MS)
+        }
+    }
 
-        // Seed phase：仅用过去 10 秒的事件初始化 sticky，并把这些事件登记到 seenEvents
-        // 防止主循环 overlap 把它们当成新事件再处理（E1/E2 幽灵的来源之一）。
+    /**
+     * 播种：用过去 10 秒的 UsageEvents 回放得出「此刻最可能的前台」。
+     *
+     * 只在检测（重）启动时跑一次 —— 服务冷启动、亮屏、无障碍重连之后。
+     * 冷启动且 10 秒窗口得不出结论时，回看一次本次开机以来的历史。
+     */
+    private suspend fun seedForeground() {
         val initNow = System.currentTimeMillis()
-        val isFirstPollForService = !startupSeedAttempted
-        // screen-off 可能在跨进程 query 中途取消当前协程；先落闸，下一次亮屏只做 10s seed。
+        val isFirstSeed = !startupSeedAttempted
         startupSeedAttempted = true
-        lastQueryTime = initNow - SEED_WINDOW_MS
-        var seedQueryFailed = false
-        try {
-            queryUsageEvents(lastQueryTime, initNow + 1_000L)
-                .sortedWith(eventOrder)
-                .forEach { event ->
-                    foregroundInterpreter.seed(event.toForegroundEvent())
-                    seenEvents[
-                        EventKey(
-                            event.timestamp,
-                            event.eventType,
-                            event.packageName,
-                            event.className,
-                        )
-                    ] = initNow
-                }
+        val seeded = try {
+            replayForeground(
+                queryUsageEvents(initNow - SEED_WINDOW_MS, initNow + 1_000L)
+                    .sortedWith(eventOrder),
+            )
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            // 主循环下一轮仍会从 lastQueryTime overlap 重试；一次瞬时 binder 异常
-            // 不能让整个 pollJob 永久退出。
+            // 一次瞬时 binder 异常不能弄死整个检测；sticky 留给下一个无障碍事件建立。
             Log.e(DIAG_TAG, "foreground seed failed", error)
-            foregroundInterpreter.reset()
-            seenEvents.clear()
-            seedQueryFailed = true
+            null
         }
-        val seededForeground = foregroundInterpreter.stickyPackageName
-        val shouldRecoverHistory = shouldAttemptStartupHistoryRecovery(
-            seededPackage = seededForeground,
-            isFirstPollForService = isFirstPollForService,
-        )
-        val historyResult = if (shouldRecoverHistory) {
+        val historyResult = if (shouldAttemptStartupHistoryRecovery(seeded, isFirstSeed)) {
             recoverStartupForegroundFromEvents(initNow)
         } else {
             StartupHistoryResult(packageName = null, querySucceeded = false)
         }
-        val startupDecision = decideStartupForeground(
-            seededPackage = seededForeground,
-            historyPackage = historyResult.packageName,
-        )
-        // Seed 失败时保留完整回溯窗口，让正常主循环的下一次 query 再试一次；
-        // 成功时仍沿用原来的 300ms overlap，避免重复解释初始化事件。
-        lastQueryTime = if (seedQueryFailed && !historyResult.querySucceeded) {
-            initNow - SEED_WINDOW_MS
-        } else {
-            initNow
-        }
+        val startupDecision = decideStartupForeground(seeded, historyResult.packageName)
+        foregroundHub.tracker.forceForeground(startupDecision.packageName)
         executeTick(
             foreground = startupDecision.packageName,
             now = initNow,
             entryEdge = startupDecision.recoveredFromHistory &&
                 startupDecision.packageName in monitoredCache,
         )
-
-        while (currentCoroutineActive()) {
-            try {
-                val now = System.currentTimeMillis()
-                val monitored = monitoredCache
-
-                if (monitored.isEmpty() &&
-                    sessionStore.all().isEmpty() &&
-                    stateMachine.state !is InterceptStateMachine.State.Prompting
-                ) {
-                    foregroundInterpreter.reset()
-                    seenEvents.clear()
-                    lastQueryTime = now
-                    delay(POLL_NO_MONITORED_TICK_MS)
-                    continue
-                }
-
-                val queryStart = lastQueryTime - 300L
-                val events = queryUsageEvents(queryStart, now + 1000L)
-                    .sortedWith(eventOrder)
-                // 查询挂起时取消/退出回调可能推进 Home barrier。解释返回的事件必须用
-                // 返回后的观察时刻，否则旧 now < barrier 会被误判成“系统时钟回拨”。
-                val observedNow = System.currentTimeMillis()
-                lastQueryTime = now
-                pruneSeenEvents(now)
-
-                events.forEach { ev ->
-                    if (ev.eventType !in trackedEventTypes) return@forEach
-                    val key = EventKey(ev.timestamp, ev.eventType, ev.packageName, ev.className)
-                    if (seenEvents.put(key, now) != null) return@forEach
-                    if (postHomeEventGuard.shouldDropStaleResume(
-                            isResume = ev.eventType == UsageEvents.Event.ACTIVITY_RESUMED,
-                            eventTimestamp = ev.timestamp,
-                            packageName = ev.packageName,
-                            monitored = monitored,
-                            now = observedNow,
-                        )
-                    ) {
-                        debugLog {
-                            "drop stale post-home RESUMED pkg=${ev.packageName} ts=${ev.timestamp}"
-                        }
-                        return@forEach
-                    }
-                    processEvent(ev, observedNow)
-                }
-
-                // PAUSED 没等到 RESUMED 跟来：超出 200ms 视为真离开
-                maybeAgePendingPause(observedNow)
-
-                // 兜底：事件流如果错过了 RESUMED（部分 ROM / 某些场景下），sticky 会卡在 null。
-                // 查 UsageStats 看看 OS 当前认为前台是什么，必要时补一脚状态机。
-                maybeReconcileWithUsageStats(observedNow)
-
-                // 兜底：SessionTimer 的 delay 协程在部分 ROM 上会被省电冻结、到点不回调。
-                // 这里用墙钟绝对时间每轮复查，发现到期就主动推进状态机，不依赖 delay。
-                maybeAdvanceElapsedSessions(observedNow)
-            } catch (t: Exception) {
-                debugLog { "poll exception=${t::class.java.simpleName}: ${t.message}" }
-            }
-            delay(pollDelayMs())
-        }
-    }
-
-    private fun processEvent(ev: UsageEventSnapshot, now: Long) {
-        debugLog {
-            "event ${eventName(ev.eventType)} pkg=${ev.packageName} cls=${ev.className} " +
-                "ts=${ev.timestamp} ${foregroundInterpreter.debugState()}"
-        }
-        foregroundInterpreter.process(ev.toForegroundEvent(), now).forEach { change ->
-            executeTick(change.packageName, change.at, change.isEntryEdge)
-        }
-    }
-
-    private fun eventName(eventType: Int): String = when (eventType) {
-        UsageEvents.Event.ACTIVITY_RESUMED -> "RESUMED"
-        UsageEvents.Event.ACTIVITY_PAUSED -> "PAUSED"
-        UsageEvents.Event.ACTIVITY_STOPPED -> "STOPPED"
-        else -> eventType.toString()
-    }
-
-    private fun UsageEventSnapshot.toForegroundEvent(): ForegroundEventInterpreter.Event {
-        val type = when (eventType) {
-            UsageEvents.Event.ACTIVITY_RESUMED -> ForegroundEventInterpreter.EventType.Resumed
-            UsageEvents.Event.ACTIVITY_PAUSED -> ForegroundEventInterpreter.EventType.Paused
-            UsageEvents.Event.ACTIVITY_STOPPED -> ForegroundEventInterpreter.EventType.Stopped
-            else -> error("Unsupported foreground event type: $eventType")
-        }
-        return ForegroundEventInterpreter.Event(
-            timestamp = timestamp,
-            eventType = type,
-            packageName = packageName,
-            className = className,
-        )
     }
 
     /**
-     * 当事件流漏发 RESUMED 导致 sticky 未知或停在 launcher/稳定页时，查 UsageStats
-     * 获取带时间戳的候选；只有它比最近事件新且符合当前状态，才拨 sticky 并补 tick。
-     *
-     * 节流到至少 [USAGE_STATS_CHECK_MIN_INTERVAL_MS] 一次，避免每个 poll 周期都跨进程查。
+     * 播种回放：按序应用 RESUMED/PAUSED/STOPPED，得出窗口末端的前台包。
+     * 刻意只做最简单的精确匹配回放 —— 它是「校准起点」而不是「持续真相源」，
+     * 回放结束之后每一个变化都由无障碍事件驱动。
      */
-    private suspend fun maybeReconcileWithUsageStats(now: Long) {
-        val sticky = foregroundInterpreter.stickyPackageName
-        val state = stateMachine.state
-        val stickyIsMonitored = sticky != null && sticky in monitoredCache
-        val waitingForInitialSessionEntry =
-            state is InterceptStateMachine.State.InSession && state.initialEntryPending
-        val reconcilableState =
-            state is InterceptStateMachine.State.Background ||
-                state is InterceptStateMachine.State.Unknown ||
-                state is InterceptStateMachine.State.SessionLeaving ||
-                waitingForInitialSessionEntry
-        if (!reconcilableState || stickyIsMonitored) return
-        if (postHomeEventGuard.shouldSkipUsageStatsReconcile(now)) return
-        if (now >= lastUsageStatsCheckAt &&
-            now - lastUsageStatsCheckAt < USAGE_STATS_CHECK_MIN_INTERVAL_MS
-        ) return
-        if (monitoredCache.isEmpty()) return
-        lastUsageStatsCheckAt = now
-        val candidate = queryCurrentForegroundFromStats(now) ?: return
-        val applyNow = System.currentTimeMillis()
-        // binder 查询本身也可能卡住；返回时已经跨出 freshness/leave deadline 的快照
-        // 不能再按查询前的 now 应用，否则会把久离误当成宽限内重入。
-        if (candidate.lastTimeUsed <= applyNow - USAGE_STATS_FRESHNESS_MS) return
-        // queryUsageStats 在后台线程运行；回来时 prompt/session 可能已由别的主线程回调推进。
-        // 用最新状态和最新事件证据做最终仲裁，不能拿查询前的快照覆盖新状态。
-        val currentState = stateMachine.state
-        val currentSticky = foregroundInterpreter.stickyPackageName
-        val shouldApply = shouldApplyUsageStatsForeground(
-            state = currentState,
-            stickyPackage = currentSticky,
-            lastUsageEvidenceAt = foregroundInterpreter.lastUsageEvidenceAt,
-            eventsQueriedThrough = lastQueryTime,
-            candidate = candidate,
-            monitored = monitoredCache,
-        )
-        if (!shouldApply) return
-        val realFg = candidate.packageName
-        val realFgIsMonitored = realFg in monitoredCache
-        debugLog {
-            "reconcile from UsageStats: sticky=$currentSticky state=$currentState -> $candidate " +
-                "realFgIsMonitored=$realFgIsMonitored"
+    private fun replayForeground(events: List<UsageEventSnapshot>): String? {
+        var pkg: String? = null
+        var cls: String? = null
+        for (event in events) {
+            when (event.eventType) {
+                UsageEvents.Event.ACTIVITY_RESUMED -> {
+                    pkg = event.packageName
+                    cls = event.className
+                }
+                UsageEvents.Event.ACTIVITY_PAUSED,
+                UsageEvents.Event.ACTIVITY_STOPPED,
+                -> if (event.packageName == pkg && (cls == null || event.className == cls)) {
+                    pkg = null
+                    cls = null
+                }
+            }
         }
-        foregroundInterpreter.forceForeground(realFg, observedAt = candidate.lastTimeUsed)
-        executeTick(realFg, applyNow, entryEdge = realFgIsMonitored)
+        return pkg
+    }
+
+    private suspend fun recoverStartupForegroundFromEvents(now: Long): StartupHistoryResult {
+        // 只在 10 秒 seed 无法得出前台时回看一次，且不跨越本次开机，
+        // 否则 BOOT_COMPLETED 可能复活上次关机前的旧前台。
+        return try {
+            val pkg = replayForeground(
+                queryUsageEvents(
+                    startupHistoryStartMillis(
+                        nowMillis = now,
+                        elapsedRealtimeMillis = SystemClock.elapsedRealtime(),
+                        recoveryWindowMillis = STARTUP_EVENT_RECOVERY_WINDOW_MS,
+                    ),
+                    now + 1_000L,
+                ).sortedWith(eventOrder),
+            )
+            StartupHistoryResult(packageName = pkg, querySucceeded = true)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.e(DIAG_TAG, "foreground history recovery failed", error)
+            StartupHistoryResult(packageName = null, querySucceeded = false)
+        }
     }
 
     /**
@@ -593,68 +532,26 @@ class AppMonitorService : LifecycleService() {
         }
     }
 
-    private suspend fun queryCurrentForegroundFromStats(now: Long): UsageStatsForeground? =
+    private suspend fun queryUsageEvents(startMillis: Long, endMillis: Long): List<UsageEventSnapshot> =
         withContext(Dispatchers.Default) {
-            val stats = try {
-                usm.queryUsageStats(
-                    UsageStatsManager.INTERVAL_BEST,
-                    now - USAGE_STATS_FRESHNESS_MS,
-                    now,
+            val events = usm.queryEvents(startMillis, endMillis)
+            val ev = UsageEvents.Event()
+            val result = ArrayList<UsageEventSnapshot>()
+            while (events.hasNextEvent()) {
+                events.getNextEvent(ev)
+                if (ev.eventType !in trackedEventTypes) continue
+                val packageName = ev.packageName ?: continue
+                result.add(
+                    UsageEventSnapshot(
+                        timestamp = ev.timeStamp,
+                        eventType = ev.eventType,
+                        packageName = packageName,
+                        className = ev.className,
+                    )
                 )
-            } catch (_: Exception) {
-                null
-            } ?: return@withContext null
-            stats
-                .filter { it.packageName != null && it.lastTimeUsed > now - USAGE_STATS_FRESHNESS_MS }
-                .maxByOrNull { it.lastTimeUsed }
-                ?.let { UsageStatsForeground(it.packageName, it.lastTimeUsed) }
+            }
+            result
         }
-
-    private suspend fun recoverStartupForegroundFromEvents(now: Long): StartupHistoryResult {
-        // 只在 10 秒 seed 无法得出前台时回看一次。和 aggregate UsageStats 的“最近使用”
-        // 不同，这里也会看到 launcher 的 RESUMED/PAUSED，停在桌面时不会把旧目标误判回来。
-        try {
-            queryUsageEvents(
-                startupHistoryStartMillis(
-                    nowMillis = now,
-                    elapsedRealtimeMillis = SystemClock.elapsedRealtime(),
-                    recoveryWindowMillis = STARTUP_EVENT_RECOVERY_WINDOW_MS,
-                ),
-                now + 1_000L,
-            )
-                .sortedWith(eventOrder)
-                .forEach { event ->
-                    foregroundInterpreter.seed(event.toForegroundEvent())
-                    if (event.timestamp >= now - SEED_WINDOW_MS) {
-                        seenEvents[
-                            EventKey(
-                                event.timestamp,
-                                event.eventType,
-                                event.packageName,
-                                event.className,
-                            )
-                        ] = now
-                    }
-                }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            Log.e(DIAG_TAG, "foreground history recovery failed", error)
-            foregroundInterpreter.reset()
-            seenEvents.clear()
-            return StartupHistoryResult(packageName = null, querySucceeded = false)
-        }
-        return StartupHistoryResult(
-            packageName = foregroundInterpreter.stickyPackageName,
-            querySucceeded = true,
-        )
-    }
-
-    private fun maybeAgePendingPause(now: Long) {
-        foregroundInterpreter.agePendingPause(now).forEach { change ->
-            executeTick(change.packageName, change.at, change.isEntryEdge)
-        }
-    }
 
     private fun executeTick(foreground: String?, now: Long, entryEdge: Boolean = false) {
         val beforeState = stateMachine.state
@@ -674,7 +571,7 @@ class AppMonitorService : LifecycleService() {
                 "tick foreground=$foreground entryEdge=$entryEdge " +
                     "initialEntryPending=$beforeInitialEntryPending->$afterInitialEntryPending " +
                     "before=$beforeState state=${stateMachine.state} effects=$effects " +
-                    foregroundInterpreter.debugState()
+                    foregroundHub.tracker.debugState()
             }
         }
         execute(effects)
@@ -685,7 +582,7 @@ class AppMonitorService : LifecycleService() {
     }
 
     /**
-     * 「今天拦不拦」：临时暂停优先于周几规则。每轮 tick 用当前时间重算，跨午夜 / 暂停到期
+     * 「今天拦不拦」：临时暂停优先于周几规则。每次 tick 用当前时间重算，跨午夜 / 暂停到期
      * 都能自然切换，不依赖任何定时器。判定用绝对时间戳，保证跨进程、设备重启后语义一致。
      */
     private fun shouldInterceptNow(nowMillis: Long): Boolean =
@@ -701,11 +598,11 @@ class AppMonitorService : LifecycleService() {
             is Effect.SendHome -> promptPresenter.sendHome(effect.pkg)
             Effect.Dismiss -> promptPresenter.dismiss()
             is Effect.ShowPrompt -> {
-                if (ensureMonitoringPermissionsOrStop()) promptPresenter.showPrompt(effect.pkg)
+                if (ensureMonitoringPermissions()) promptPresenter.showPrompt(effect.pkg)
             }
             is Effect.ShowTimeUp -> {
                 Log.w("ReasonTimer", "Effect.ShowTimeUp pkg=${effect.pkg}")
-                if (ensureMonitoringPermissionsOrStop()) promptPresenter.showTimeUp(effect.pkg)
+                if (ensureMonitoringPermissions()) promptPresenter.showTimeUp(effect.pkg)
             }
             is Effect.FinishSession -> finishSession(effect.pkg, effect.endedAt, effect.overran)
             is Effect.RecordInterceptOutcome ->
@@ -736,46 +633,8 @@ class AppMonitorService : LifecycleService() {
         sessionLeaveJob = null
     }
 
-    private fun pollDelayMs(): Long =
-        when (stateMachine.state) {
-            is InterceptStateMachine.State.Prompting -> POLL_PROMPT_TICK_MS
-            is InterceptStateMachine.State.InSession -> POLL_SESSION_TICK_MS
-            is InterceptStateMachine.State.SessionLeaving -> POLL_SESSION_TICK_MS
-            is InterceptStateMachine.State.TimeUp -> POLL_TIMEUP_TICK_MS
-            is InterceptStateMachine.State.Background,
-            is InterceptStateMachine.State.Unknown -> {
-                if (monitoredCache.isEmpty()) POLL_NO_MONITORED_TICK_MS else POLL_IDLE_TICK_MS
-            }
-        }
-
-    private suspend fun queryUsageEvents(startMillis: Long, endMillis: Long): List<UsageEventSnapshot> =
-        withContext(Dispatchers.Default) {
-            val events = usm.queryEvents(startMillis, endMillis)
-            val ev = UsageEvents.Event()
-            val result = ArrayList<UsageEventSnapshot>()
-            while (events.hasNextEvent()) {
-                events.getNextEvent(ev)
-                if (ev.eventType !in trackedEventTypes) continue
-                val packageName = ev.packageName ?: continue
-                result.add(
-                    UsageEventSnapshot(
-                        timestamp = ev.timeStamp,
-                        eventType = ev.eventType,
-                        packageName = packageName,
-                        className = ev.className,
-                    )
-                )
-            }
-            result
-        }
-
-    private fun pruneSeenEvents(now: Long) {
-        val cutoff = now - SEEN_EVENT_TTL_MS
-        val it = seenEvents.iterator()
-        while (it.hasNext()) {
-            if (it.next().value < cutoff) it.remove() else break
-        }
-    }
+    private var sessionLeaveJob: Job? = null
+    private var sessionLeaveGeneration = 0L
 
     private fun finishSession(pkg: String, endedAt: Long, overran: Boolean) =
         sessionStore.finish(pkg, endedAt, overran)
@@ -791,25 +650,55 @@ class AppMonitorService : LifecycleService() {
         }
     }
 
-    private fun ensureMonitoringPermissionsOrStop(): Boolean {
+    /**
+     * 监控门控。
+     *
+     * 可监控 = 使用情况访问 + 悬浮窗 + **无障碍服务此刻真的被系统绑定**。
+     * 第三项必须用 [AccessibilityForegroundHub.isConnected]（绑定真相）而不是设置项：
+     * 国产 ROM 杀掉无障碍服务后设置开关常常仍是开的，按设置项放行会让监控在
+     * 「事件流已断」的情况下盲跑 —— 现象就是「开关都在，却突然不拦了」。
+     *
+     * 原实现缺任一权限就 stopSelf，而「主动 stop」会连同 START_STICKY 的重启资格一起
+     * 取消；现在改为降级：停循环、把常驻通知换成「已暂停」，服务本体继续活着，
+     * 等权限恢复（[MonitoringPermissionObserver] / 无障碍重连回调）或看门狗下次拉起时自愈。
+     *
+     * 通知权限单独放宽：它只影响常驻通知的可见性，不影响拦截能力，不该因此停掉监控。
+     *
+     * @return true 表示可以继续弹窗 / 驱动状态机；false 表示已进入降级。
+     */
+    private fun ensureMonitoringPermissions(): Boolean {
         val state = try {
             MonitoringPermissions.current(this)
         } catch (error: RuntimeException) {
+            // 读权限本身抛异常不能等同于「权限丢了」，否则一次 binder 抖动就停摆。
             Log.e(DIAG_TAG, "monitoring permission check failed", error)
-            MonitoringPermissionState(usageAccess = false, overlay = false, notification = false)
+            return true
         }
-        if (!state.isReady) {
-            Log.w("ReasonTimer", "permissions NOT ready usage=${state.usageAccess} overlay=${state.overlay} notif=${state.notification}")
-            stopForMissingPermissions()
+        val canMonitor = state.usageAccess && state.overlay && foregroundHub.isConnected
+        if (canMonitor) {
+            if (degradedState != null) {
+                Log.w(DIAG_TAG, "permissions restored; leaving degraded mode")
+                degradedState = null
+                resumeDetection()
+                refreshNotification()
+            }
+            return true
         }
-        return state.isReady
-    }
-
-    private fun stopForMissingPermissions() {
-        if (stoppingForMissingPermissions) return
-        stoppingForMissingPermissions = true
-        pauseDetection()
-        stopSelf()
+        if (degradedState == null) {
+            Log.w(
+                DIAG_TAG,
+                "NOT ready usage=${state.usageAccess} overlay=${state.overlay} " +
+                    "a11yConnected=${foregroundHub.isConnected}; entering degraded mode",
+            )
+            degradedState = state
+            suspendPolling()
+            // 降级后必须留一个低频复查循环，否则权限恢复时没有任何东西把监控叫回来。
+            if (notifJob?.isActive != true) {
+                notifJob = lifecycleScope.launch { notificationTickLoop() }
+            }
+            refreshNotification()
+        }
+        return false
     }
 
     private suspend fun currentCoroutineActive(): Boolean = currentCoroutineContext().isActive
@@ -861,36 +750,19 @@ class AppMonitorService : LifecycleService() {
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "monitor"
         private const val DIAG_TAG = "ReasonMonitor"
-        // 每个 tick 都是一次跨进程 queryEvents（还带 1s 回溯窗口）。只有 IDLE 需要真的快 ——
-        // 它决定「打开受监控 app 到弹出拦截窗」的延迟，是核心体验，保持 100ms。
-        // 其余三个状态没有任何时间敏感的事要做：拦截窗 / 到点窗已经挂在屏幕上，session 期间
-        // 只需要察觉离开，而离开本身还要再过 PAUSE_REENTRY_GAP_MS(200ms) 和 10s 宽限期。
-        // 之前 30ms 意味着一个 30 分钟的 session 要打约 6 万次 binder，纯粹是白烧电。
-        private const val POLL_PROMPT_TICK_MS = 100L
-        private const val POLL_SESSION_TICK_MS = 150L
-        private const val POLL_TIMEUP_TICK_MS = 100L
-        private const val POLL_IDLE_TICK_MS = 100L
-        private const val POLL_NO_MONITORED_TICK_MS = 1_000L
+
+        /**
+         * 维护 tick：纯内存的到点 session 复查。实时性（打开 app 多久弹窗）由无障碍
+         * 事件保证，与这里无关；1s 一次只是为了省电冻结场景下到点窗最多晚 1 秒。
+         */
+        private const val MAINTENANCE_TICK_MS = 1_000L
         private const val NOTIFICATION_ACTIVE_TICK_MS = 60_000L
         private const val NOTIFICATION_IDLE_TICK_MS = 60_000L
-        private const val SEEN_EVENT_TTL_MS = 1_000L
+        /** 降级期间复查权限的间隔。权限恢复没有广播可听，只能低频轮询。 */
+        private const val DEGRADED_PERMISSION_CHECK_MS = 15_000L
         private const val SEED_WINDOW_MS = 10_000L
-        // UsageStats can keep reporting the just-blocked app as "recent" for up to
-        // USAGE_STATS_FRESHNESS_MS after we intentionally send the user Home.
-        private const val POST_HOME_USAGE_STATS_SUPPRESS_MS = 6_000L
-        /** PAUSED 后超过这个 gap 还没等到 RESUMED 跟来，就视为用户真的离开了。
-         *  内含应用内跳页 / 系统瞬态 pause 的容忍度（通常 < 50ms），与人类 Home + 重进
-         *  时间（通常 >= 300ms）有足够区分度。 */
-        private const val PAUSE_REENTRY_GAP_MS = 200L
 
-        /** UsageStats 兜底查询节流间隔。事件流正常时这条路基本不会走。 */
-        private const val USAGE_STATS_CHECK_MIN_INTERVAL_MS = 500L
-
-        /** 只信任 UsageStats 在最近 N 毫秒内有过 lastTimeUsed 更新的条目；
-         *  防止把很久之前的"最后使用 app"误当成当前前台。 */
-        private const val USAGE_STATS_FRESHNESS_MS = 5_000L
-
-        /** 只在 service 冷启动且 10 秒 seed 无法得出前台时读取一次，不进入常态轮询。 */
+        /** 只在 service 冷启动且 10 秒 seed 无法得出前台时读取一次，不进入常态循环。 */
         private const val STARTUP_EVENT_RECOVERY_WINDOW_MS = 24L * 60L * 60L * 1_000L
 
         private val trackedEventTypes = setOf(
@@ -899,8 +771,7 @@ class AppMonitorService : LifecycleService() {
             UsageEvents.Event.ACTIVITY_STOPPED,
         )
 
-        // 同 ms 内排序：STOPPED 优先（直接清 sticky），其次 PAUSED（挂 pendingPause），最后 RESUMED
-        // （更新 sticky，可能消化 pendingPause）。这样 C3 的"离开+回来"必然先发离开信号。
+        // 播种回放内的排序：同 ms 内 STOPPED 优先，其次 PAUSED，最后 RESUMED。
         private val eventOrder =
             compareBy<UsageEventSnapshot> { it.timestamp }
                 .thenByDescending { it.eventType }
@@ -912,8 +783,7 @@ class AppMonitorService : LifecycleService() {
                 false
             }
             if (!ready) return
-            val intent = Intent(context, AppMonitorService::class.java)
-            context.startForegroundService(intent)
+            startForegroundSafely(context, reason = "start")
         }
 
         /**
@@ -929,8 +799,49 @@ class AppMonitorService : LifecycleService() {
                 false
             }
             if (!ready) return
-            val intent = Intent(context, AppMonitorService::class.java)
-            context.startForegroundService(intent)
+            startForegroundSafely(context, reason = "deadline pkg=$packageName")
+        }
+
+        /**
+         * 看门狗触发时调用。
+         *
+         * 与 [start] 不同，这里不预先检查权限：权限缺失时更需要把服务立起来，
+         * 让常驻通知告诉用户「为什么没拦」，而不是静默地什么都不做。
+         * 降级判断由 [onStartCommand] 内部完成。
+         */
+        fun startForWatchdog(context: Context) {
+            startForegroundSafely(context, reason = "watchdog")
+        }
+
+        /**
+         * 无障碍服务被系统绑定时调用。
+         *
+         * 这是全项目最可靠的复活点：进程被 ROM 杀掉后，只要无障碍开关还开着，
+         * 系统就会重新绑定 [ForegroundAccessibilityService]，而「有服务被系统绑定」
+         * 命中 Android 12+ 后台启动前台服务的豁免条款，所以这里的启动不会被拒绝。
+         */
+        fun startFromAccessibility(context: Context) {
+            startForegroundSafely(context, reason = "accessibility")
+        }
+
+        /**
+         * Android 12+ 从后台启动前台服务受限制，未命中豁免时会抛
+         * ForegroundServiceStartNotAllowedException（IllegalStateException 的子类）。
+         *
+         * 这里必须吞掉：抛出去会让 BroadcastReceiver 直接崩，而崩溃的 receiver 不留任何
+         * 用户可见痕迹 —— 现象就是「闹钟明明该到点了，却什么都没发生」。
+         * 失败的这次不补做重试，等看门狗下一个周期或用户下次打开 app 自然重来。
+         */
+        private fun startForegroundSafely(context: Context, reason: String) {
+            try {
+                context.startForegroundService(Intent(context, AppMonitorService::class.java))
+            } catch (error: IllegalStateException) {
+                Log.w(
+                    "ReasonWatchdog",
+                    "foreground start blocked ($reason); will retry on next tick",
+                    error,
+                )
+            }
         }
     }
 }

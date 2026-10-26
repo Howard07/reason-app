@@ -1,6 +1,7 @@
 package me.excuse.app.ui.onboarding
 
 import android.app.AppOpsManager
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
@@ -11,7 +12,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Process
 import android.provider.Settings
+import android.view.accessibility.AccessibilityManager
 import androidx.core.app.ActivityCompat
+import me.excuse.app.service.ForegroundAccessibilityService
 
 object PermissionUtils {
 
@@ -82,6 +85,35 @@ object PermissionUtils {
             Uri.parse("package:${context.packageName}")
         ).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
         context.startActivity(intent)
+    }
+
+    /**
+     * 无障碍服务是否已由用户开启。
+     *
+     * 用 [AccessibilityManager.getEnabledAccessibilityServiceList] 而不是读
+     * `Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES`：后者在部分 ROM 上是逗号拼接的
+     * 扁平分号串，格式不稳定，还要自己处理 `包名/类名` 的解析。
+     */
+    fun hasAccessibility(context: Context): Boolean {
+        val manager = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+            ?: return false
+        val target = ComponentName(context, ForegroundAccessibilityService::class.java)
+        return manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .any { info ->
+                val serviceInfo = info.resolveInfo?.serviceInfo ?: return@any false
+                ComponentName(serviceInfo.packageName, serviceInfo.name) == target
+            }
+    }
+
+    fun openAccessibilitySettings(context: Context) {
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        try {
+            context.startActivity(intent)
+        } catch (_: Exception) {
+            openAppDetailsSettings(context)
+        }
     }
 
     enum class AutostartResult { OPENED_VENDOR, OPENED_BATTERY, OPENED_APP_DETAILS, FAILED }

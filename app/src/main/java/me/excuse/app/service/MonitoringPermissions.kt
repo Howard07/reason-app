@@ -7,14 +7,16 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.provider.Settings
+import me.excuse.app.ui.onboarding.PermissionUtils
 
 internal data class MonitoringPermissionState(
     val usageAccess: Boolean,
     val overlay: Boolean,
     val notification: Boolean,
+    val accessibility: Boolean,
 ) {
     val isReady: Boolean
-        get() = usageAccess && overlay && notification
+        get() = usageAccess && overlay && notification && accessibility
 }
 
 internal object MonitoringPermissions {
@@ -33,6 +35,9 @@ internal object MonitoringPermissions {
             usageAccess = usageAccess,
             overlay = Settings.canDrawOverlays(context),
             notification = notification,
+            // 注意：这是「设置里开了开关」，不等于服务此刻被绑定。国产 ROM 杀掉无障碍
+            // 服务后开关常常仍是开的；运行期门控要用 AccessibilityForegroundHub.isConnected。
+            accessibility = PermissionUtils.hasAccessibility(context),
         )
     }
 }

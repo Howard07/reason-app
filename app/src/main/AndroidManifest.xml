@@ -92,6 +92,22 @@
                 android:value="Monitor foreground app launches to enforce user-defined reflective pauses." />
         </service>
 
+        <!-- 系统托管支点：进程被杀后由系统重新绑定，绑定期间命中 Android 12+
+             后台启动前台服务的豁免条款，因此也是全项目最可靠的复活点。
+             只订阅窗口状态变化，canRetrieveWindowContent=false，读不到任何界面内容。 -->
+        <service
+            android:name=".service.ForegroundAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
         <receiver
             android:name=".service.BootReceiver"
             android:enabled="true"
@@ -104,6 +120,13 @@
 
         <receiver
             android:name=".service.DeadlineAlarmReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
+        <!-- 存活看门狗。闹钟由 AlarmManager 触发，广播带本应用的 uid，
+             因此可以保持不导出；系统投递 PendingIntent 时以创建者身份执行。 -->
+        <receiver
+            android:name=".service.WatchdogReceiver"
             android:enabled="true"
             android:exported="false" />
     </application>

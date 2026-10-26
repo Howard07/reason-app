@@ -72,9 +72,10 @@ class ServiceStartupPolicyTest {
 
     @Test
     fun everyRequiredPermissionMustRemainGranted() {
-        assertTrue(MonitoringPermissionState(true, true, true).isReady)
-        assertFalse(MonitoringPermissionState(false, true, true).isReady)
-        assertFalse(MonitoringPermissionState(true, false, true).isReady)
-        assertFalse(MonitoringPermissionState(true, true, false).isReady)
+        assertTrue(MonitoringPermissionState(true, true, true, true).isReady)
+        assertFalse(MonitoringPermissionState(false, true, true, true).isReady)
+        assertFalse(MonitoringPermissionState(true, false, true, true).isReady)
+        assertFalse(MonitoringPermissionState(true, true, false, true).isReady)
+        assertFalse(MonitoringPermissionState(true, true, true, false).isReady)
     }
 }

@@ -9,6 +9,9 @@
     <string name="notification_paused">已暂停拦截</string>
     <string name="notification_paused_until">已暂停拦截 · 还剩 %1$d 分钟</string>
     <string name="notification_rest_day">今日休息，不拦截</string>
+    <string name="notification_degraded">监控已暂停 · 点开检查权限</string>
+    <string name="accessibility_service_label">给一个理由</string>
+    <string name="accessibility_service_description">让「给一个理由」在系统清理后台之后能自己恢复，并在切换窗口时立刻检查一次前台应用。只读取当前窗口属于哪个应用，不读取屏幕内容、不读取输入、不截图、不联网。</string>
     <string name="app_category_game">游戏</string>
     <string name="app_category_social">社交</string>
     <string name="app_category_media">影音</string>
