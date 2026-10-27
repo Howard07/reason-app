@@ -1,9 +1,13 @@
 package me.excuse.app.service
 
 import android.accessibilityservice.AccessibilityService
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.inputmethod.InputMethodManager
 import me.excuse.app.MainActivity
 
 /**
@@ -32,6 +36,28 @@ class ForegroundAccessibilityService : AccessibilityService() {
         )?.activityInfo?.packageName
     }
 
+    /**
+     * 当前启用的输入法包名。服务每次被系统重新绑定都会重建实例，因此这里拿到的
+     * 始终是本轮最新的输入法列表（用户换输入法后无需额外刷新逻辑）。
+     */
+    private val inputMethodPackages: Set<String> by lazy { resolveInputMethodPackages() }
+
+    private fun resolveInputMethodPackages(): Set<String> {
+        val packages = LinkedHashSet<String>()
+        runCatching {
+            Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+                ?.let { ComponentName.unflattenFromString(it)?.packageName }
+                ?.let(packages::add)
+        }
+        runCatching {
+            (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                ?.enabledInputMethodList
+                ?.forEach { packages.add(it.packageName) }
+        }
+        Log.w(TAG, "input method packages=$packages")
+        return packages
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.w(TAG, "connected; ensuring monitor service is running")
@@ -44,18 +70,32 @@ class ForegroundAccessibilityService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
         val cls = event.className?.toString()
 
-        // 本 app 的悬浮窗（拦截窗/到点窗）也带本包名，认了等于误判「用户离开了受监控
-        // app」；只有用户真的回到主界面（MainActivity）才算一次前台切换。
-        if (pkg == packageName && cls != MainActivity::class.java.name) return
-
-        val foreground: String? = when {
-            // 桌面 = 离开当前 app。Recents/通知栏/锁屏属于 SystemUI，没有 launcher
-            // 入口，会被下面这条直接忽略 —— 停留在 Recents 上不算切换。
-            pkg == homePackage -> null
-            !isLaunchable(pkg) -> return
-            else -> pkg
+        val classified = classifyAccessibilityWindow(
+            packageName = pkg,
+            className = cls,
+            windowType = windowTypeOf(event),
+            ownPackage = packageName,
+            ownMainActivityClassName = MainActivity::class.java.name,
+            homePackage = homePackage,
+            inputMethodPackages = inputMethodPackages,
+            isLaunchable = ::isLaunchable,
+        )
+        val foreground: String? = when (classified) {
+            AccessibilityWindowClass.Ignore -> return
+            AccessibilityWindowClass.Home -> null
+            is AccessibilityWindowClass.App -> classified.packageName
         }
         AccessibilityForegroundHub.publishWindow(foreground, cls, System.currentTimeMillis())
+    }
+
+    /**
+     * 事件所属窗口的类型。拿不到（部分 ROM 的 getWindows 返回空，或 windowId 无效）
+     * 时返回 null，分类逻辑会退回纯包名判据。
+     */
+    private fun windowTypeOf(event: AccessibilityEvent): Int? {
+        val windows = runCatching { windows }.getOrNull() ?: return null
+        if (windows.isEmpty()) return null
+        return windows.firstOrNull { it.id == event.windowId }?.type
     }
 
     private fun isLaunchable(pkg: String): Boolean =

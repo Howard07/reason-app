@@ -31,8 +31,8 @@ android {
         applicationId = "me.excuse.app.zh"
         minSdk = 29
         targetSdk = 35
-        versionCode = 180
-        versionName = "1.8.0"
+        versionCode = 200
+        versionName = "2.0.0"
     }
 
     buildTypes {
